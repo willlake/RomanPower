@@ -126,6 +126,4 @@ Multi-GPU 3D FFT and halo exchange support is provided by:
 `RomanPower` is a derivative of [`jax-power`](https://github.com/adematti/jax-power) — thanks to
 **Arnaud de Mattia** for the original package.
 
-Thanks to **Hugo Simon-Onfroy** for providing JIT-friendly resamplers via [`montecosmo`](https://github.com/hsimonfroy).
-
 ---

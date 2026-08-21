@@ -8,7 +8,7 @@ requires = [
 
 [project]
 name = "roman-power"
-authors = [{name = "Will Lake"}]
+authors = [{name = "Wei Liu"}, {name = "Jaide Swanson"}]
 description = "Power spectrum estimation for Roman, based on jax-power by Arnaud de Mattia"
 version = "0.2.0"
 dependencies = ["jax", "jaxdecomp", "lsstypes @ git+https://github.com/adematti/lsstypes"]
