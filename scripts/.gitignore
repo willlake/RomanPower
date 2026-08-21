@@ -1,0 +1,5 @@
+*plots/*
+*tests/*
+*.zip
+test.py
+rotation_old*

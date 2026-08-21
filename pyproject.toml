@@ -1,0 +1,21 @@
+[build-system]
+requires = [
+    "setuptools>=61",
+    "wheel",
+    "setuptools_scm>=6.2",
+    "pip>=21.2",
+]
+
+[project]
+name = "roman-power"
+authors = [{name = "Will Lake"}]
+description = "Power spectrum estimation for Roman, based on jax-power by Arnaud de Mattia"
+version = "0.2.0"
+dependencies = ["jax", "jaxdecomp", "lsstypes @ git+https://github.com/adematti/lsstypes"]
+readme = "README.md"
+requires-python = ">=3.10"
+urls = {Repository = "https://github.com/willlake/RomanPower", "Upstream" = "https://github.com/adematti/jax-power"}
+classifiers = ["Programming Language :: Python :: 3"]
+
+[tool.setuptools]
+packages = ["romanpower"]
