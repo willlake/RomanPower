@@ -2840,9 +2840,13 @@ def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sha
         coords = coords.ravel()
 
         ibin = jnp.digitize(coords, edges, right=False)
-        x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+        length = len(edges) + 1
+        nsub = _get_nsub(length)
+        sbin = ibin * nsub + _sub_index(ibin.size, nsub, ibin.dtype) if nsub > 1 else ibin
+        x = _spread_bincount(sbin, coords if weights is None else coords * weights, length, nsub)[1:-1]
         del coords
-        nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+        nmodes = _spread_bincount(sbin, weights, length, nsub)[1:-1]
+        del sbin
         if not ravel:
             ibin = ibin.reshape(shape)
         return ibin, nmodes, x
@@ -2873,6 +2877,38 @@ def _get_bin_attrs_edges2d(coords, edges: jax.Array, weights: None | jax.Array=N
     return battrs, edges_1d, M
 
 
+# XLA:GPU lowers a scatter-add into atomics on the destination buffer. Binning a mesh
+# sends every cell (16.7e6 for 256^3) into a couple of hundred k-bins, and the resulting
+# contention makes a single bincount take seconds on an A100 -- three orders of magnitude
+# off memory bandwidth. Giving each bin its own private accumulators removes the
+# contention; the enlarged table still fits in L2, and we sum the copies at the end.
+_bincount_nsub = 1024  # number of sub-accumulators per bin; 1 restores plain bincount
+_bincount_max_table = 2**21  # cap on length * nsub, to bound the extra memory
+
+
+def _get_nsub(length):
+    """Number of sub-accumulators to spread a scatter-add over (1 = no spreading)."""
+    if _bincount_nsub <= 1 or jax.default_backend() != 'gpu':
+        return 1
+    return max(1, min(_bincount_nsub, _bincount_max_table // max(length, 1)))
+
+
+def _sub_index(size, nsub, dtype):
+    """0, 1, ... nsub - 1, 0, 1, ... -- which sub-accumulator each entry adds into.
+
+    Built by tiling rather than ``jnp.arange(size) % nsub``, so that it stays within
+    ``dtype`` for meshes with more than 2**31 cells.
+    """
+    return jnp.tile(jnp.arange(nsub, dtype=dtype), size // nsub + 1)[:size]
+
+
+def _spread_bincount(ib, weights, length, nsub):
+    """:func:`jnp.bincount`, with the additions spread over ``nsub`` accumulators per bin."""
+    if nsub <= 1:
+        return jnp.bincount(ib, weights=weights, length=length)
+    return jnp.bincount(ib, weights=weights, length=length * nsub).reshape(length, nsub).sum(axis=-1)
+
+
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=('length', 'sharding_mesh'))
 def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
@@ -2884,14 +2920,15 @@ def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
         value = value.ravel()
         if weights is not None:
             value *= weights
+        nsub = _get_nsub(length + 2)
 
         def count(ib):
-            return jnp.bincount(ib, weights=value, length=length + 2)
-
-        if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
-
-            def count(ib):
-                return jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
+            if nsub > 1:  # ib is consumed only through the spread index
+                ib = ib * nsub + _sub_index(ib.size, nsub, ib.dtype)
+            if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
+                return (_spread_bincount(ib, value.real, length + 2, nsub)
+                        + 1j * _spread_bincount(ib, value.imag, length + 2, nsub))
+            return _spread_bincount(ib, value, length + 2, nsub)
 
         value = sum(count(ib.ravel() if ib.ndim > 1 else ib) for ib in ibin)
         return value[1:-1] / len(ibin)
