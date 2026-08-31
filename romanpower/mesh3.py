@@ -123,7 +123,16 @@ def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None
     mask = mask_edges(*list_edges)
     edges = edges[mask]
     xavg = _product(xavg1d)[mask]
-    nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
+    nmodes = _product(nmodes1d)[mask]
+    if jnp.issubdtype(nmodes.dtype, jnp.integer):
+        # The per-axis counts are small, but their product is not: a 750^3 mesh already
+        # passes 2**31 - 1 at k ~ 0.03, and an int32 product wraps there silently --
+        # negative counts, and a bispectrum divided by them (see compute_mesh3_spectrum)
+        # that is wrong from that bin on. int64 is exact but only exists under
+        # jax_enable_x64; without it, float32 is the widest type available and still
+        # resolves these counts to ~1e-7, far below the estimator's own noise.
+        nmodes = nmodes.astype(jnp.int64 if jax.config.jax_enable_x64 else jnp.float32)
+    nmodes = jnp.prod(nmodes, axis=-1)
     iedges = _product(iedges1d)[mask]
     nmodes = [nmodes] * len(ells)
 
