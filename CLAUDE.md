@@ -73,6 +73,7 @@ For bispectra, replace `mesh2` → `mesh3` throughout.
 | `mesh3.py` | 3-point bispectrum: `BinMesh3SpectrumPoles`, `compute_mesh3_spectrum` |
 | `particle2/3.py` | Direct particle-pair / triplet statistics (uses `cucount.jax`) |
 | `cov2/3.py` | Covariance and window matrices; `compute_fkp2_covariance_window` |
+| `thecov.py` | Analytic covariance of $P_{0,2,4}$ in the CovaPT / thecov formulation: survey window kernels (Gaussian term), regular trispectrum $T_0$ + shot-noise trispectrum, super-sample covariance. Opt-in (`from romanpower import thecov`), switches `jax_enable_x64` on at import. Validated against `thecov` / `powercovfft` in `~/Projects/Roman/Thecov/thecov_jax/VALIDATION.md` |
 | `types.py` | JAX pytree registration for `lsstypes` observable classes |
 | `resamplers.py` | NGP/CIC/TSC/PCS painting kernels |
 | `kernels.py` | Spectral kernels (gradient, Gaussian smoothing) |
