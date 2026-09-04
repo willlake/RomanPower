@@ -37,8 +37,10 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   random halves painted on a fine mesh (the window of the FKP field, i.e. of the *weighted* density), where
   thecov's catalogue sum $\alpha \sum_r n(z_r) w_c w_\mathrm{FKP}^2$ is one power of the completeness weight
   short when `NZ` is the number density: on the DESI LRG randoms this raises the Gaussian variance by 9%
-  and closes most of the "analytic variance 10% low" gap to the mocks; a Gaussian-mock closure test with
-  the real window reproduces the mock variance to 0.2-0.5% (VALIDATION.md section 7).
+  and closes most of the "analytic variance 10% low" gap to the mocks: that deficit was the window
+  definition, not the kernels, and `cov2.py` -- which squares the painted weighted density and whose
+  Gaussian variance was 9% higher -- was right. A Gaussian-mock closure test with the real window
+  reproduces the mock variance to 0.2-0.5% (VALIDATION.md section 7).
 
 ### Fixed
 
