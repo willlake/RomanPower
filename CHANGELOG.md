@@ -33,6 +33,12 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   \hat k_1$ approximation that makes the three-multipole Gaussian matrix indefinite
   ($\mathrm{tr}(C_\mathrm{ana}^{-1} C_\mathrm{mock})/N \simeq 4.5$ instead of 1.1 on the DESI LRG mocks; see
   VALIDATION.md section 6); `exact_high_order=False` reproduces their kernels.
+  `MeshWindow.from_randoms` builds $W_{22} = (\alpha n_r w_c w_\mathrm{FKP})^2$ as the product of two
+  random halves painted on a fine mesh (the window of the FKP field, i.e. of the *weighted* density), where
+  thecov's catalogue sum $\alpha \sum_r n(z_r) w_c w_\mathrm{FKP}^2$ is one power of the completeness weight
+  short when `NZ` is the number density: on the DESI LRG randoms this raises the Gaussian variance by 9%
+  and closes most of the "analytic variance 10% low" gap to the mocks; a Gaussian-mock closure test with
+  the real window reproduces the mock variance to 0.2-0.5% (VALIDATION.md section 7).
 
 ### Fixed
 

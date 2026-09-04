@@ -201,6 +201,33 @@ def test_exact_high_order_products():
     assert 1e-3 < np.abs(kE[..., 2] - kA[..., 2]).max() / np.abs(kA[..., 2]).max() < 0.5   # (4,4) changes
 
 
+def test_mesh_window():
+    """MeshWindow.from_randoms (W22 = W11_A W11_B on a fine mesh, two random halves) vs SurveyWindow (catalogue sum) for uniform weights."""
+    rng = np.random.default_rng(3)
+    L, N, nbar = 1500., 1_000_000, 1e-4
+    pos = rng.uniform(-L / 2, L / 2, size=(N, 3)); pos[:, 2] += 20 * L
+    alpha = nbar * L**3 / N
+    win = tj.SurveyWindow(pos, nz=np.full(N, nbar), alpha=alpha, kmax_window=0.02)
+    mw = tj.MeshWindow.from_randoms(pos, np.full(N, alpha), w12=np.full(N, alpha), boxsize=win.boxsize, boxcenter=np.asarray(win.attrs.boxcenter),
+                                    fine_meshsize=4 * win.meshsize, meshsize=win.meshsize)
+    # for a uniform cube I22 = nbar^2 L^3; the cross product of two random halves is free of the randoms' Poisson noise
+    # (squaring one painted catalogue gives 1.5 x more with ~2 randoms per cell); the residual is the mesh smoothing of the edges
+    assert np.isclose(mw.I('22'), nbar**2 * L**3, rtol=0.03), (mw.I('22'), nbar**2 * L**3)
+    assert np.isclose(mw.I('12'), win.I('12'), rtol=1e-6)
+    a, b = np.asarray(mw.W('W22')), np.asarray(win.W('W22'))
+    assert np.isclose(a[0, 0, 0].real / b[0, 0, 0].real, mw.I('22') / win.I('22'), rtol=1e-6)
+    # normalized window shapes agree at low q; at larger q the catalogue noise of the cross product shows (see VALIDATION.md, section 7)
+    ik = win.ikgrid(); kr = np.sqrt((ik**2).sum(0)) * win.kfun
+    sel = (kr > 0) & (kr < 0.004)
+    ratio = (a / a[0, 0, 0]) / (b / b[0, 0, 0])
+    assert np.median(np.abs(ratio[sel] - 1)) < 0.03, np.median(np.abs(ratio[sel] - 1))
+    kedges = tj.linear_kedges(0.02, 0.05, 0.01)
+    kA = tj.compute_window_kernels(win, kedges, kmodes_sampled=16, batch_size=4, progress=False, seed=1, exact_high_order=False)
+    kB = tj.compute_window_kernels(mw, kedges, kmodes_sampled=16, batch_size=4, progress=False, seed=1, exact_high_order=False)
+    d = np.diag(kB[..., 0, 0]) / np.diag(kA[..., 0, 0]) * (win.I('22') / mw.I('22'))**2
+    assert np.all(np.abs(d - 1) < 0.05), d
+
+
 def test_cube_vs_box(L=1500., nbar=1e-4, nrandoms=int(4e5), kmodes=200):
     """A cube of randoms far from the observer must reproduce the periodic-box Gaussian covariance up to the window leakage."""
     pk_lin, poles, f, b1 = get_pk()

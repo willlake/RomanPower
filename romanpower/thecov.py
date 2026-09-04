@@ -61,7 +61,7 @@ from .utils import get_legendre
 
 logger = logging.getLogger('thecov')
 
-__all__ = ['SurveyWindow', 'count_kbins', 'linear_kedges', 'sample_kmodes', 'count_modes',
+__all__ = ['SurveyWindow', 'MeshWindow', 'count_kbins', 'linear_kedges', 'sample_kmodes', 'count_modes',
            'compute_window_kernels', 'gaussian_covariance_survey', 'gaussian_covariance_box',
            'compute_trispectrum_covariance', 'compute_ssc_covariance', 'pbs_bias_parameters',
            'blocks_to_matrix', 'matrix_to_blocks', 'to_covariance_matrix', 'kernel_labels']
@@ -475,6 +475,113 @@ class SurveyWindow(object):
         if np.isnan(kavg[0]): kavg[0] = 0.
         self._window_power = (kavg, power)
         return self._window_power
+
+
+class MeshWindow(SurveyWindow):
+    r"""
+    Survey window given as meshes instead of a random catalogue: :math:`W_{22}(x)` (and optionally :math:`W_{12}(x)`)
+    as arrays of *weights per cell* (i.e. :math:`\int_\mathrm{cell} W(x) d^3x`) on a (fine) mesh, whose Cartesian
+    moments are FFT'd and cut to the ``meshsize`` cube of the kernel computation. Meant for tests with Gaussian random
+    fields multiplied by a known window :math:`W_{11}(x)`: then :math:`W_{22} = W_{11}^2 / V_\mathrm{cell}` and
+    :math:`W_{12} = 0` (no shot noise).
+
+    Parameters
+    ----------
+    W22 : array (n, n, n)
+        Weights per cell of :math:`W_{22}` on the fine mesh (real).
+    attrs : MeshAttrs
+        Attributes of the fine mesh (box size, box center, mesh size).
+    meshsize : int
+        Size of the FFT cube kept for the kernels (its Nyquist wavenumber is ``kmax_window``); must be <= the fine mesh.
+    W12 : array, optional
+        Weights per cell of :math:`W_{12}` (default 0).
+    """
+    def __init__(self, W22, attrs, meshsize, W12=None):
+        self.fine_attrs = attrs
+        self.fine_meshsize = int(attrs.meshsize[0])
+        self.boxsize = float(attrs.boxsize[0])
+        self.meshsize = int(meshsize)
+        assert self.meshsize <= self.fine_meshsize
+        self.kmax_window = np.pi * self.meshsize / self.boxsize
+        self.attrs = MeshAttrs(meshsize=self.meshsize, boxsize=self.boxsize, boxcenter=attrs.boxcenter, dtype=complex, fft_backend='jax')
+        self._cells = {'22': jnp.asarray(W22), '12': None if W12 is None else jnp.asarray(W12)}
+        self.alpha = 1.
+        self.size = 0
+        self.paint_kwargs = {}
+        self._W, self._I, self._window_power, self._windows = {}, {}, None, {}
+        x = self.fine_attrs.rcoords(kind='position', sparse=True)
+        r2 = sum(xx**2 for xx in x)
+        self._xhat = [xx / jnp.sqrt(r2) for xx in x]
+        n, m = self.fine_meshsize, self.meshsize
+        self._cut = np.r_[0:m // 2, n - m // 2:n]  # FFT-order indices of the central cube |ik| < m/2
+        self.logger.info(f'Mesh window: fine mesh {n}, kernel cube {m}, box size {self.boxsize:.1f}, knyquist {self.knyquist:.4f}.')
+
+    @classmethod
+    def from_randoms(cls, positions, w11, w12=None, boxsize=None, boxcenter=None, fine_meshsize=288, meshsize=36,
+                     resampler='tsc', interlacing=3, compensate=True, chunk_size=4_000_000, split_seed=42):
+        r"""
+        Build the window from a random catalogue with :math:`W_{22} = W_{11}^2 / V_\mathrm{cell}` where :math:`W_{11}(x)`
+        is the painted weighted density :math:`\alpha n_r w_c w_\mathrm{FKP}` (per-random weights ``w11``), i.e. the
+        window of the FKP field, and :math:`W_{12}` painted from ``w12`` (e.g. :math:`\alpha (w_c w_\mathrm{FKP})^2`).
+        This is the correct :math:`W_{22}` when the completeness weights vary; :class:`SurveyWindow`'s catalogue sum
+        :math:`\alpha \sum_r n(z_r) w_c w_\mathrm{FKP}^2` (thecov's prescription) has one power of :math:`w_c` less
+        unless the ``nz`` column is the weighted density (VALIDATION.md, section 7).
+
+        The square is taken as the product of two independent random halves of the catalogue (each with doubled
+        weights), so that the Poisson noise of the randoms (self-pairs) does not add a white floor to :math:`W_{22}(q)`
+        (as ``split`` in :func:`romanpower.cov2.compute_fkp2_covariance_window`); ``split_seed`` draws the halves.
+        """
+        positions = np.asarray(positions, dtype='f8')
+        if boxcenter is None or boxsize is None:
+            pos_min, pos_max = positions.min(axis=0), positions.max(axis=0)
+            if boxcenter is None: boxcenter = 0.5 * (pos_min + pos_max)
+            if boxsize is None: boxsize = 2. * np.max(pos_max - pos_min)
+        attrs = MeshAttrs(meshsize=int(fine_meshsize), boxsize=float(boxsize), boxcenter=np.asarray(boxcenter, dtype='f8') * np.ones(3), dtype=float, fft_backend='jax')
+        kw = dict(resampler=resampler, interlacing=interlacing, compensate=compensate, out='real')
+
+        def paint(w):
+            out = None
+            for start in range(0, len(positions), int(chunk_size)):
+                sl = slice(start, start + int(chunk_size))
+                m = ParticleField(positions[sl], np.asarray(w)[sl], attrs=attrs).paint(**kw)
+                out = m if out is None else out + m
+            return out.value
+
+        rng = np.random.default_rng(split_seed)
+        half = rng.random(len(positions)) < 0.5
+        w11 = np.asarray(w11, dtype='f8')
+        W22 = paint(2. * w11 * half) * paint(2. * w11 * (~half)) / float(attrs.cellsize.prod())
+        W12 = None if w12 is None else paint(w12)
+        return cls(W22, attrs, meshsize, W12=W12)
+
+    def _cells_of(self, base):
+        c = self._cells.get(base)
+        if c is None:
+            c = jnp.zeros((self.fine_meshsize,) * 3)
+        return c
+
+    def weights(self, label):
+        raise NotImplementedError('MeshWindow has no particles')
+
+    def I(self, label):
+        base, _ = self._parse(label)
+        if base not in self._I:
+            self._I[base] = float(jnp.sum(self._cells_of(base)))
+        return self._I[base]
+
+    def sum_weights_product(self, label1, label2):
+        return 0.
+
+    def W(self, label):
+        base, moment = self._parse(label)
+        key = 'W' + base + moment
+        if key not in self._W:
+            field = self._cells_of(base)
+            for c in moment:
+                field = field * self._xhat[_XYZ.index(c)]
+            full = jnp.fft.fftn(field)
+            self._W[key] = full[np.ix_(self._cut, self._cut, self._cut)]
+        return self._W[key]
 
 
 # ----------------------------------------------------------------------------------------------------------------------
