@@ -495,7 +495,10 @@ class CorrelationToSpectrum(object):
     __getattr__ = SpectrumToCorrelation.__getattr__
     __call__ = SpectrumToCorrelation.__call__
     tree_flatten = SpectrumToCorrelation.tree_flatten
-    tree_unflatten = SpectrumToCorrelation.tree_unflatten
+    # Do not write `tree_unflatten = SpectrumToCorrelation.tree_unflatten`: that attribute is a
+    # classmethod already bound to SpectrumToCorrelation, so copying it makes cls -- and hence
+    # cls.__new__(cls) -- SpectrumToCorrelation whatever class it is reached through.
+    tree_unflatten = classmethod(SpectrumToCorrelation.tree_unflatten.__func__)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -657,6 +660,16 @@ class BaseFFTEngine(object):
         if nthreads is not None:
             os.environ['OMP_NUM_THREADS'] = str(nthreads)
         self.nthreads = int(os.environ.get('OMP_NUM_THREADS', 1))
+
+    # The engine travels in the aux_data of :meth:`FFTlog.tree_flatten`, which JAX compares to decide
+    # whether two pytrees share a treedef: value equality (the engine is stateless beyond these three
+    # numbers) lets FFTlog differing only by Bessel order reuse a single jit compilation.
+    def __eq__(self, other):
+        return (type(other) is type(self) and other.size == self.size
+                and other.nparallel == self.nparallel and other.nthreads == self.nthreads)
+
+    def __hash__(self):
+        return hash((type(self).__name__, self.size, self.nparallel, self.nthreads))
 
 
 class JAXFFTEngine(BaseFFTEngine):

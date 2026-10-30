@@ -1,8 +1,10 @@
 import time
+import itertools
 from pathlib import Path
 from functools import partial
 
 import numpy as np
+import pytest
 from matplotlib import pyplot as plt
 import jax
 from jax import random
@@ -12,7 +14,7 @@ from romanpower import (compute_mesh3, compute_mesh3_spectrum, BinMesh3SpectrumP
                       FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils, ParticleField, compute_smooth3_spectrum_window, create_sharding_mesh)
 
 
-dirname = Path('_tests')
+dirname = Path(__file__).parent / '_tests'
 
 
 def test_mesh3_spectrum(plot=False):
@@ -81,7 +83,7 @@ def test_fkp3_shotnoise():
 
     edges = [np.arange(0.01, knyq / 2., 0.01) for knyq in mattrs.knyq]
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='scoccimarro', ells=[0, 2])
-    test_shotnoise([10013.975399104605, -104.97685444849071])
+    test_shotnoise([10013.975399104605, -198.61264451840495])  # l = 2: legs-(a, 3) pair term fixed
 
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0), (2, 0, 2)])
     test_shotnoise([10139.357378112192, 380.2427505962978])
@@ -97,7 +99,7 @@ def test_timing():
     import time
     from jax import jit, random
     from romanpower.mesh import create_sharded_random
-    from romanpower.mesh3 import get_real_Ylm, get_spherical_jn
+    from romanpower.utils import get_Ylm, get_spherical_jn
 
     @jit
     def f1(mesh):
@@ -107,7 +109,7 @@ def test_timing():
 
     @jit
     def f2(mesh):
-        kvec = mesh.attrs.rcoords(sparse=True)
+        kvec = mesh.attrs.kcoords(sparse=True)
         xnorm = jnp.sqrt(sum(xx**2 for xx in kvec))
         mask = (xnorm >= 0.01) & (xnorm <= 0.03)
         return (Ylm(*kvec) * mesh * mask).c2r()
@@ -116,7 +118,7 @@ def test_timing():
     rmesh = attrs.create(kind='real', fill=create_sharded_random(random.normal, random.key(42), shape=attrs.meshsize))
     cmesh = rmesh.r2c()
 
-    Ylm = get_real_Ylm(2, 0)
+    Ylm = get_Ylm(2, 0, real=True)
     jn = get_spherical_jn(2)
 
     f1(rmesh)
@@ -134,7 +136,7 @@ def test_timing():
     timing(f2, cmesh)
 
 
-def test_timing():
+def test_bin_timing():
 
     from romanpower.mesh import create_sharded_random
 
@@ -161,17 +163,17 @@ def test_timing():
         meshs = []
 
         def f2(axis, ibin):
-            return bin.mattrs.c2r(values[axis].value * (bin.ibin[axis] == ibin))
+            return bin.mattrs.c2r(values[axis].value * (bin.ibin1d[axis] == ibin))
 
         for axis in range(3):
-            meshs.append(jax.lax.map(partial(f2, axis), xs=jnp.arange(len(bin._nmodes1d[axis]))))
+            meshs.append(jax.lax.map(partial(f2, axis), xs=jnp.arange(len(bin.nmodes1d[axis]))))
 
         def f2(ibin):
             return jnp.sum(meshs[0][ibin[0]] * meshs[1][ibin[1]] * meshs[2][ibin[2]])
 
         return jax.lax.map(f2, bin._iedges)
 
-    bk1 = test(f)
+    bk1 = test(f) * bin.mattrs.meshsize.prod(dtype=bin.mattrs.rdtype)**2  # the normalization bin() applies
     bk2 = test(bin.__call__, jit=True)
     assert np.allclose(bk1, bk2)
 
@@ -216,6 +218,7 @@ def test_buffer():
 
 
 def test_polybin3d(plot=False):
+    pytest.importorskip('PolyBin3D')
 
     def pk(k):
         kp = 0.03
@@ -283,6 +286,7 @@ def test_polybin3d(plot=False):
 
 
 def test_triumvirate_box_spectrum(plot=False):
+    pytest.importorskip('triumvirate')
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -358,6 +362,7 @@ def test_triumvirate_box_spectrum(plot=False):
 
 
 def test_triumvirate_box_correlation(plot=False):
+    pytest.importorskip('triumvirate')
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -430,6 +435,7 @@ def test_triumvirate_box_correlation(plot=False):
 
 
 def test_triumvirate_survey_spectrum(plot=False):
+    pytest.importorskip('triumvirate')
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -510,6 +516,7 @@ def test_triumvirate_survey_spectrum(plot=False):
 
 
 def test_triumvirate_survey_correlation(plot=False):
+    pytest.importorskip('triumvirate')
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -620,16 +627,6 @@ def survey_selection(size=int(1e7), seed=42, scale=0.25, paint=True):
     toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
     if paint: toret = toret.paint(resampler='ngp', interlacing=1, compensate=False)
     return toret
-
-
-def test_fisher():
-    from romanpower.mesh3 import compute_fisher_scoccimarro
-
-    selection = survey_selection()
-    mattrs = selection.attrs
-    edges = np.arange(0.01, mattrs.knyq[0], 0.01)
-    bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='scoccimarro', ells=[0, 2])
-    fisher = compute_fisher_scoccimarro(selection, bin=bin)
 
 
 def test_bincount():
@@ -867,8 +864,8 @@ def test_smooth_window(plot=False):
         if plot:
             plot_zeta(zeta, show=True)
 
-    fn = '_tests/zeta.h5'
-    if False:
+    fn = dirname / 'zeta.h5'
+    if not fn.exists():  # local, not in git: built on the first run
         zetas = []
         for scale in [1, 4]:
             selection = gaussian_survey(mattrs, mattrs=mattrs.clone(boxsize=scale * mattrs.boxsize), paint=True)
@@ -888,6 +885,7 @@ def test_smooth_window(plot=False):
         zeta2.write(fn)
 
     zeta2 = read(fn)
+    # The dominant cost here is the 2048-point window s-grid above: the 2-D FFTlog goes as its square.
     wmatrix = compute_smooth3_spectrum_window(zeta2, edgesin=edgesin, ellsin=ellsin, bin=bin)
     wpoles = wmatrix.dot(np.concatenate([p.ravel() for p in poles]), return_type=None)
     if plot:
@@ -968,6 +966,7 @@ def test_smooth_window_sugiyama_synthetic(plot=False):
     if plot:
         plot_zeta(zeta, s=1., show=True)
 
+    # The dominant cost here is the 2048-point window s-grid above: the 2-D FFTlog goes as its square.
     wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
     wpoles = wmatrix.dot(np.concatenate([tt.ravel() for tt in theory]), return_type=None)
     if plot:
@@ -1044,7 +1043,7 @@ def test_smooth_window_scoccimarro_synthetic(plot=False):
         plot_zeta(zeta, s=1., show=True)
 
     wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
-    kin = wmatrix.theory.get(ells=0).coords('k')
+    kin = wmatrix.theory.get(ells=0).coords('k')   # (k1, k2, k3) at which to evaluate the model
     bk = pk(kin[:, 0]) * pk(kin[:, 1]) * pk(kin[:, 2])
     theory = [1. / (1 + ell) * bk for ell in ellsin]
 
@@ -1191,28 +1190,80 @@ def test_ref():
 
 
 
-if __name__ == '__main__':
+def test_scoccimarro_symmetrization_matrix():
+    """The ordered -> unordered theory scatter matrix, and its two inference directions.
 
-    #import os
-    #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-    #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
+    The estimator bins ordered triangles k1 <= k2 <= k3, but the window convolution runs over all
+    of k'-space, so the matrix must be handed the unordered grid; filling it is a theory-side
+    statement about which permutations leave B_L' invariant. fix_legs=(2,) is exact for EVERY L'
+    (swapping k1 <-> k2 leaves the line-of-sight leg alone), all six only for L' = 0.
+    """
+    from romanpower import get_scoccimarro_symmetrization_matrix as sym
 
-    from jax import config
-    config.update('jax_enable_x64', True)
-    #config.update('jax_num_cpu_devices', 4)
-    #config.update('jax_platform_name', 'cpu')
-    #test_ref()
-    #test_misc()
-    #test_fftlog2(plot=True)
-    #test_buffer()
-    test_misc()
-    test_mesh3_spectrum()
-    test_fkp3_shotnoise()
-    test_polybin3d()
-    test_triumvirate_box_spectrum()
-    test_triumvirate_survey_spectrum()
-    test_normalization()
-    test_fftlog2()
-    test_smooth_window_sugiyama_synthetic()
-    test_smooth_window()
-    #test_mesh3_spectrum_soccimarro_shotnoise()
+    cen = np.array([0.03, 0.05, 0.07])
+    ordered = np.array([[a, b, c] for a in cen for b in cen for c in cen if a <= b <= c])
+    edges_ordered = np.stack([ordered - 0.01, ordered + 0.01], axis=-1)
+
+    # build the unordered grid from the ordered one, edges carried along
+    S, kin, kin_ord, edges = sym(kin_ordered=ordered, edges_ordered=edges_ordered)
+    assert np.allclose(kin_ord, ordered)                      # echoed unchanged
+    assert edges.shape == (len(kin), 3, 2)
+    assert len(kin) == 27, len(kin)                           # 3^3 distinct permuted boxes
+    # every unordered box draws from exactly one ordered bin, and the column sums are the
+    # permutation multiplicities: 1 (equilateral), 3 (two equal), 6 (all distinct)
+    assert np.all(S.sum(axis=1) == 1.)
+    assert set(np.unique(S.sum(axis=0)).astype(int)) == {1, 3, 6}, np.unique(S.sum(axis=0))
+    for j, t in enumerate(ordered):
+        assert int(S[:, j].sum()) == len(set(itertools.permutations(np.round(t, 12))))
+
+    # fix_legs=(2,) keeps only the k1 <-> k2 swaps: multiplicity 1 or 2, and a strict subset
+    Sf, *_ = sym(kin=kin, kin_ordered=ordered, fix_legs=(2,))
+    assert set(np.unique(Sf.sum(axis=0)).astype(int)) <= {1, 2}
+    assert np.all(Sf <= S) and Sf.sum() < S.sum()
+    # rows with no admissible permutation stay ZERO -- missing k'-space must show up as a
+    # sum-rule shortfall, never be invented
+    assert np.any(Sf.sum(axis=1) == 0.)
+
+    # infer the ordered grid back from the unordered one
+    S2, _, ord2, edges2 = sym(kin=kin)
+    assert edges2 is None                                     # not inferrable from centres alone
+    assert np.allclose(np.sort(ord2, axis=0), np.sort(ordered, axis=0))
+    assert np.allclose(S2, S)
+    try:
+        sym()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('expected ValueError when both grids are omitted')
+    print('test_scoccimarro_symmetrization_matrix OK')
+
+
+def test_wide_angle3_coeffs():
+    # The first-order change of the TripoSH basis under n_c = x3 + (r1 + r2)_perp / (3 x3), against finite differences:
+    # 3 * get_wide_angle3_theory_coeffs gives the derivative along the leg direction, (r_hat_i)_perp . grad_n S_{l1 l2 L}.
+    from scipy.special import sph_harm_y
+    from romanpower.utils import wigner_3j
+    from romanpower.mesh3 import get_wide_angle3_theory_coeffs
+
+    def y(ell, m, v):
+        theta, phi = np.arccos(np.clip(v[..., 2], -1, 1)), np.arctan2(v[..., 1], v[..., 0])
+        return np.sqrt(4 * np.pi / (2 * ell + 1)) * sph_harm_y(ell, m, theta, phi)
+
+    def S(l1, l2, L, a, b, n):
+        toret = 0.
+        for m1 in range(-l1, l1 + 1):
+            for m2 in range(-l2, l2 + 1):
+                if abs(m1 + m2) > L: continue
+                toret = toret + wigner_3j(l1, l2, L, m1, m2, -m1 - m2) * y(l1, m1, a) * y(l2, m2, b) * y(L, -m1 - m2, n)
+        return toret
+
+    normalize = lambda v: v / np.linalg.norm(v, axis=-1)[..., None]
+    rng = np.random.default_rng(42)
+    a, b, n = (normalize(rng.normal(size=(500, 3))) for _ in range(3))
+    eps = 1e-6
+    for ellin in [(0, 0, 0), (2, 0, 2), (0, 2, 2), (1, 1, 2), (2, 2, 2), (2, 2, 4), (1, 3, 2), (4, 4, 4)]:
+        for wa, v in [((1, 0), a), ((0, 1), b)]:
+            vperp = v - np.sum(v * n, axis=-1)[:, None] * n
+            ref = (S(*ellin, a, b, normalize(n + eps * vperp)) - S(*ellin, a, b, normalize(n - eps * vperp))) / (2 * eps)
+            test = sum((3. * coeff * S(*child, a, b, n) for child, coeff in get_wide_angle3_theory_coeffs(ellin, wa)), 0. * ref)
+            assert np.allclose(test, ref, atol=1e-7 * max(np.max(np.abs(ref)), 1.)), (ellin, wa)

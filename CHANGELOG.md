@@ -42,6 +42,27 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   Gaussian variance was 9% higher -- was right. A Gaussian-mock closure test with the real window
   reproduces the mock variance to 0.2-0.5% (VALIDATION.md section 7).
 
+### Changed
+
+- **Synced with upstream `jax-power` up to `191d5c8` (2026-10-12)**, from the fork base `99f5905`:
+  28 upstream commits, among them the `cov3` rewrite (multitracer, survey windows), new modules
+  `meshn.py`, `oqe.py` and `angular.py`, the deterministic-quadrature Scoccimarro bispectrum window,
+  first-order wide-angle corrections in the smooth windows, fixed third-order SPT kernels in `pt.py`,
+  the Hermitian weight of the Nyquist plane, the $\ell > 0$ bispectrum shot noise, and `_slab_bincount`
+  for float32 accumulation accuracy. See `git log 99f5905..191d5c8` in `jax-power` for the full list.
+  It requires an `lsstypes` that defines `MeshNSpectrumPole` (upstream `fc83ddf` or later).
+
+  The fork's two patches carried over:
+  - The GPU bincount fix and upstream's `_slab_bincount` (`47678a7`) rewrote the same two calls in
+    `mesh.py`. `_slab_bincount` is kept as upstream wrote it, dtype rules included, except that on GPU
+    the accumulation is split round-robin over sub-accumulators instead of into contiguous slabs.
+    Accuracy is the same, but the slabs still leave concurrent threads adding into one accumulator.
+    On an A100 (256³ mesh, 202 bins, float32) upstream's version takes 49 ms and this one 1.3 ms. CPU
+    results are bit-for-bit upstream's.
+  - The `int32` guard on the bispectrum `nmodes` product (`mesh3.py`) merged unchanged. Upstream's
+    `_slab_bincount` now returns the per-axis counts as int64 under x64 and float32 without it, which
+    fixes the overflow at its source, so the guard no longer triggers. It is kept as a safeguard.
+
 ### Fixed
 
 - **`nmodes` overflowed `int32` in the bispectrum binning**, silently corrupting
@@ -112,10 +133,25 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   symmetry). (iii) `_Z3` lacks the $b_2 F_2(k_2, k_3)$ and $2 b_{G_2} K_{G_2}(k_1, k_{23}) F_2(k_2,
   k_3)$ third-order bias terms. Diagnostics: `~/Projects/Roman/Thecov/thecov_jax/debug_t0.py`.
 
+  *Probably superseded by the upstream sync:* `spectrum4_redshift_tracer` and `_para_channel` no
+  longer exist. Upstream `8110473` fixed the $F_3$/$G_3$ recursion (i), replaced the parallelogram
+  special case with a regularised generic evaluation (ii), and `24e25c6` carries the second-order bias
+  sector in full above third order (iii). The tree n-point now comes from `make_spectra_redshift_tracer`.
+  This has not been re-checked against `thecov._PTKernels`.
+
 - `tests/test_mesh3.py::test_fkp3_shotnoise` fails under `jax_enable_x64 = False`. The test
   compares against hard-coded reference values with `np.allclose` at its default
   tolerances, which single precision does not meet; the test file's `__main__` block sets
   x64 on. Pre-existing, unrelated to the fixes above.
+- Upstream tests that the sync brings in broken. Each fails the same way with pristine upstream:
+  - `tests/test_pt_trispectrum.py` and `tests/test_pt_stochastic.py` do not import. They need
+    `pt.spectrum4_redshift_tracer`, which upstream `24e25c6` removed.
+  - `tests/test_mesh2.py::test_smooth_window` raises "Input x must be log-spaced" in `fftlog`, on CPU
+    and GPU, with x64 too.
+  - Under plain `pytest`, three tests in `test_oqe.py`, three in `test_angular.py` and
+    `test_mesh3.py::test_buffer` miss their tolerances in float32. Like `test_fkp3_shotnoise`, they
+    pass with `JAX_ENABLE_X64=1`; their files set x64 only in `__main__`. `test_buffer` misses on a
+    single near-zero bin out of 100, and its median buffered-vs-unbuffered difference is 1.5e-7.
 - The window multipoles $Q_\ell$ are sums of spherical Bessel functions over the Fourier
   mesh, and the cancellation grows sharply with $\ell$. Measured against the DESI DR2
   reference on a 750³ mesh, `max|diff|/max|ref|` over $1 < s < 3000$ Mpc/$h$:

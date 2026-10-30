@@ -188,7 +188,8 @@ class MemoryMonitor(object):
 
 
 @lru_cache(maxsize=32, typed=False)
-def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
+@lru_cache(maxsize=None)
+def _get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
     """
     Return a function that computes the real spherical harmonic of order (ell, m).
     Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/convpower/fkp.py.
@@ -334,6 +335,16 @@ def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
     return Ylm
 
 
+def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
+    # Cached: building the harmonic lambdifies a sympy expression, which costs ~0.1 s per (ell, m)
+    # and grows with ell -- ~30 s for every order up to ell = 16, as the bispectrum window's
+    # reference-leg shape factor needs. The returned closure is read-only, so sharing it is safe.
+    if isinstance(modules, list): modules = tuple(modules)
+    return _get_Ylm(int(ell), int(m), modules=modules, reduced=bool(reduced), real=bool(real), conj=bool(conj))
+
+
+get_Ylm.__doc__ = _get_Ylm.__doc__
+
 # Store in cache
 [[get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
 
@@ -353,9 +364,98 @@ _registered_legendre[10] = lambda x: 46189*x**10/256 - 109395*x**8/256 + 45045*x
 
 
 def get_legendre(ell):
+    """
+    Return a function evaluating the Legendre polynomial of order ``ell``.
+
+    ``ell`` may be traced, but must lie within the tabulated range (0 to
+    ``len(_registered_legendre) - 1``): :func:`jax.lax.switch` *clamps* an out-of-range index
+    rather than raising, which would silently return the highest tabulated order instead.
+    A static ``ell`` is checked here; a traced one cannot be, so use
+    :func:`get_legendre_recurrence` when the order may exceed the table.
+    """
+    if np.ndim(ell) == 0 and not isinstance(ell, jax.core.Tracer):
+        if not 0 <= int(ell) < len(_registered_legendre):
+            raise ValueError(f'Legendre order ell = {ell} outside the tabulated range '
+                             f'[0, {len(_registered_legendre) - 1}]; use get_legendre_recurrence instead')
 
     def legendre(x):
         return jax.lax.switch(ell, _registered_legendre, x)
+
+    return legendre
+
+
+def get_legendre_recurrence(ell, ellmax: int=None):
+    r"""
+    Return a function evaluating the Legendre polynomial of order ``ell``, using Bonnet's
+    three-term recurrence :math:`(n + 1) P_{n + 1}(x) = (2n + 1) x P_n(x) - n P_{n - 1}(x)`.
+
+    Unlike :func:`get_legendre` this has no tabulated upper bound, and accepts a **traced**
+    ``ell`` without emitting one branch per order --- :func:`jax.lax.switch` would lower every
+    tabulated branch into the graph. That is what lets callers that sum over many orders (e.g. the
+    TripoSH sums of :func:`~romanpower.mesh3.compute_smooth3_spectrum_window`) share one compilation
+    instead of one per order.
+
+    The recurrence is also numerically stable at high order, where evaluating the monomial form
+    would suffer cancellation: :math:`P_{16}` has coefficients of order :math:`10^5` with
+    alternating signs.
+
+    The recurrence is unrolled whenever its length is known statically -- exactly when ``ell`` is a
+    Python integer, and to ``ellmax`` steps followed by a select when it is traced. This matters a
+    great deal: a dynamic :func:`jax.lax.fori_loop` lowers to a while loop, whose iterations XLA
+    cannot fuse, so each of the ``ell`` steps becomes its own pass over the (potentially large)
+    input. Measured on an A100 over a 1.7e7-element array, the dynamic form costs 10.6 ms at
+    ``ell = 16`` against 0.3 ms at ``ell = 2``, while the unrolled form is a single fused pass.
+
+    Parameters
+    ----------
+    ell : int, array
+        Legendre order, possibly traced. Must be >= 0.
+    ellmax : int, optional
+        Maximum order ``ell`` can take, used to unroll the recurrence when ``ell`` is traced.
+        **Must be a true upper bound**: orders above it would silently return a lower-order
+        polynomial. Ignored when ``ell`` is static. If ``None`` and ``ell`` is traced, falls back to
+        the dynamic (unfused, much slower) loop.
+
+    Returns
+    -------
+    legendre : callable
+        Function of ``x``, returning :math:`P_{\ell}(x)`.
+    """
+    static_ell = None
+    if np.ndim(ell) == 0 and not isinstance(ell, jax.core.Tracer):
+        static_ell = int(ell)
+        if static_ell < 0:
+            raise ValueError(f'Legendre order must be >= 0, got {static_ell}')
+
+    def step(n, x, pm1, p):
+        # (n + 1) P_{n + 1} = (2n + 1) x P_n - n P_{n - 1}
+        return p, ((2 * n + 1) * x * p - n * pm1) / (n + 1)
+
+    def legendre(x):
+        x = jnp.asarray(x)
+        # carry = (P_{n - 1}, P_n), starting at n = 1
+        p0 = jnp.ones_like(x)
+        p1 = x * jnp.ones_like(x)
+
+        if static_ell is not None:  # fully unrolled, no select and no wasted step
+            if static_ell == 0: return p0
+            pm1, p = p0, p1
+            for n in range(1, static_ell):
+                pm1, p = step(n, x, pm1, p)
+            return p
+
+        n_ell = jnp.asarray(ell)
+        if ellmax is None:  # correct, but the iterations do not fuse
+            _, toret = jax.lax.fori_loop(1, n_ell, lambda n, c: step(n, x, *c), (p0, p1))
+            return jnp.where(n_ell == 0, p0, toret)
+
+        # unrolled to a static length; every step is elementwise, so the whole chain fuses
+        toret = jnp.where(n_ell == 0, p0, p1)  # covers ell = 0 and ell = 1
+        pm1, p = p0, p1
+        for n in range(1, int(ellmax)):
+            pm1, p = step(n, x, pm1, p)
+            toret = jnp.where(n_ell == n + 1, p, toret)
+        return toret
 
     return legendre
 
@@ -376,13 +476,11 @@ def get_spherical_jn_scipy(ell):
     return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x)
 
 
-def compute_sympy_bessel_tophat_integral(ell, n=11):
+def compute_sympy_bessel_tophat_integral(ell):
     import sympy as sp
     k, x = sp.symbols('k x', real=True, positive=True)
     integrand = sp.simplify(k**2 * sp.expand_func(sp.jn(ell, k * x)))
-    expr = sp.integrate(integrand, (k, 0, 1))
-    expr_lowx = sp.series(expr, x=x, x0=0, n=n).removeO()
-    return expr, expr_lowx
+    return sp.integrate(integrand, (k, 0, 1))
 
 
 def compute_sympy_legendre(ell):
@@ -392,71 +490,327 @@ def compute_sympy_legendre(ell):
     return expr
 
 
-def compute_sympy_bessel(ell, n=11):
+def compute_sympy_bessel(ell):
     import sympy as sp
     x = sp.symbols('x', real=True)
-    expr = sp.expand_func(sp.jn(ell, x))
-    expr_lowx = sp.series(expr, x=x, x0=0, n=n).removeO()
-    return expr, expr_lowx
+    return sp.expand_func(sp.jn(ell, x))
 
 
 _registered_bessel_tophat_integral = {}
-_registered_bessel_tophat_integral[0] = (lambda x: (-jnp.cos(x)/x + jnp.sin(x)/x**2)/x,
-                                         lambda x: -x**10/518918400 + x**8/3991680 - x**6/45360 + x**4/840 - x**2/30 + 1/3)
-_registered_bessel_tophat_integral[1] = (lambda x: (-jnp.sin(x) - 2*jnp.cos(x)/x)/x**2 + 2/x**3,
-                                         lambda x: x**9/47900160 - x**7/453600 + x**5/6720 - x**3/180 + x/12)
-_registered_bessel_tophat_integral[2] = (lambda x: (x*jnp.cos(x) - 4*jnp.sin(x) + 3*Si(x))/x**3,
-                                         lambda x: x**10/674593920 - x**8/5488560 + x**6/68040 - x**4/1470 + x**2/75)
-_registered_bessel_tophat_integral[3] = (lambda x: 8/x**3 + (x**2*jnp.sin(x) + 7*x*jnp.cos(x) - 15*jnp.sin(x))/x**4,
-                                         lambda x: -x**9/77837760 + x**7/831600 - x**5/15120 + x**3/630)
-_registered_bessel_tophat_integral[4] = (lambda x: (-x**3*jnp.cos(x) + 11*x**2*jnp.sin(x) + 15*x**2*Si(x)/2 + 105*x*jnp.cos(x)/2 - 105*jnp.sin(x)/2)/x**5,
-                                         lambda x: -x**10/1264863600 + x**8/11891880 - x**6/187110 + x**4/6615)
-_registered_bessel_tophat_integral[5] = (lambda x: 16/x**3 + (-x**4*jnp.sin(x) - 16*x**3*jnp.cos(x) + 105*x**2*jnp.sin(x) + 315*x*jnp.cos(x) - 315*jnp.sin(x))/x**6,
-                                         lambda x: x**9/194594400 - x**7/2702700 + x**5/83160)
+_registered_bessel_tophat_integral[0] = lambda x: (-jnp.cos(x)/x + jnp.sin(x)/x**2)/x
+_registered_bessel_tophat_integral[1] = lambda x: (-jnp.sin(x) - 2*jnp.cos(x)/x)/x**2 + 2/x**3
+_registered_bessel_tophat_integral[2] = lambda x: (x*jnp.cos(x) - 4*jnp.sin(x) + 3*Si(x))/x**3
+_registered_bessel_tophat_integral[3] = lambda x: 8/x**3 + (x**2*jnp.sin(x) + 7*x*jnp.cos(x) - 15*jnp.sin(x))/x**4
+_registered_bessel_tophat_integral[4] = lambda x: (-x**3*jnp.cos(x) + 11*x**2*jnp.sin(x) + 15*x**2*Si(x)/2 + 105*x*jnp.cos(x)/2 - 105*jnp.sin(x)/2)/x**5
+_registered_bessel_tophat_integral[5] = lambda x: 16/x**3 + (-x**4*jnp.sin(x) - 16*x**3*jnp.cos(x) + 105*x**2*jnp.sin(x) + 315*x*jnp.cos(x) - 315*jnp.sin(x))/x**6
 
 
 _registered_bessel = {}
-_registered_bessel[0] = (lambda x: jnp.sin(x)/x,
-                         lambda x: -x**10/39916800 + x**8/362880 - x**6/5040 + x**4/120 - x**2/6 + 1)
-_registered_bessel[1] = (lambda x: -jnp.cos(x)/x + jnp.sin(x)/x**2,
-                         lambda x: x**9/3991680 - x**7/45360 + x**5/840 - x**3/30 + x/3)
-_registered_bessel[2] = (lambda x: (-1/x + 3/x**3)*jnp.sin(x) - 3*jnp.cos(x)/x**2,
-                         lambda x: x**10/51891840 - x**8/498960 + x**6/7560 - x**4/210 + x**2/15)
-_registered_bessel[3] = (lambda x: (-6/x**2 + 15/x**4)*jnp.sin(x) + (1/x - 15/x**3)*jnp.cos(x),
-                         lambda x: -x**9/6486480 + x**7/83160 - x**5/1890 + x**3/105)
-_registered_bessel[4] = (lambda x: (10/x**2 - 105/x**4)*jnp.cos(x) + (1/x - 45/x**3 + 105/x**5)*jnp.sin(x),
-                         lambda x: -x**10/97297200 + x**8/1081080 - x**6/20790 + x**4/945)
-_registered_bessel[5] = (lambda x: (15/x**2 - 420/x**4 + 945/x**6)*jnp.sin(x) + (-1/x + 105/x**3 - 945/x**5)*jnp.cos(x),
-                         lambda x: x**9/16216200 - x**7/270270 + x**5/10395)
-_registered_bessel[6] = (lambda x: (-21/x**2 + 1260/x**4 - 10395/x**6)*jnp.cos(x) + (-1/x + 210/x**3 - 4725/x**5 + 10395/x**7)*jnp.sin(x),
-                         lambda x: x**10/275675400 - x**8/4054050 + x**6/135135)
-_registered_bessel[7] = (lambda x: (-28/x**2 + 3150/x**4 - 62370/x**6 + 135135/x**8)*jnp.sin(x) + (1/x - 378/x**3 + 17325/x**5 - 135135/x**7)*jnp.cos(x),
-                         lambda x: -x**9/68918850 + x**7/2027025)
-_registered_bessel[8] = (lambda x: (36/x**2 - 6930/x**4 + 270270/x**6 - 2027025/x**8)*jnp.cos(x) + (1/x - 630/x**3 + 51975/x**5 - 945945/x**7 + 2027025/x**9)*jnp.sin(x),
-                         lambda x: -x**10/1309458150 + x**8/34459425)
-_registered_bessel[9] = (lambda x: (45/x**2 - 13860/x**4 + 945945/x**6 - 16216200/x**8 + 34459425/x**10)*jnp.sin(x) + (-1/x + 990/x**3 - 135135/x**5 + 4729725/x**7 - 34459425/x**9)*jnp.cos(x),
-                         lambda x: x**9/654729075)
-_registered_bessel[10] = (lambda x: (-55/x**2 + 25740/x**4 - 2837835/x**6 + 91891800/x**8 - 654729075/x**10)*jnp.cos(x) + (-1/x + 1485/x**3 - 315315/x**5 + 18918900/x**7 - 310134825/x**9 + 654729075/x**11)*jnp.sin(x),
-                          lambda x: x**10/13749310575)
+_registered_bessel[0] = lambda x: jnp.sin(x)/x
+_registered_bessel[1] = lambda x: -jnp.cos(x)/x + jnp.sin(x)/x**2
+_registered_bessel[2] = lambda x: (-1/x + 3/x**3)*jnp.sin(x) - 3*jnp.cos(x)/x**2
+_registered_bessel[3] = lambda x: (-6/x**2 + 15/x**4)*jnp.sin(x) + (1/x - 15/x**3)*jnp.cos(x)
+_registered_bessel[4] = lambda x: (10/x**2 - 105/x**4)*jnp.cos(x) + (1/x - 45/x**3 + 105/x**5)*jnp.sin(x)
+_registered_bessel[5] = lambda x: (15/x**2 - 420/x**4 + 945/x**6)*jnp.sin(x) + (-1/x + 105/x**3 - 945/x**5)*jnp.cos(x)
+_registered_bessel[6] = lambda x: (-21/x**2 + 1260/x**4 - 10395/x**6)*jnp.cos(x) + (-1/x + 210/x**3 - 4725/x**5 + 10395/x**7)*jnp.sin(x)
+_registered_bessel[7] = lambda x: (-28/x**2 + 3150/x**4 - 62370/x**6 + 135135/x**8)*jnp.sin(x) + (1/x - 378/x**3 + 17325/x**5 - 135135/x**7)*jnp.cos(x)
+_registered_bessel[8] = lambda x: (36/x**2 - 6930/x**4 + 270270/x**6 - 2027025/x**8)*jnp.cos(x) + (1/x - 630/x**3 + 51975/x**5 - 945945/x**7 + 2027025/x**9)*jnp.sin(x)
+_registered_bessel[9] = lambda x: (45/x**2 - 13860/x**4 + 945945/x**6 - 16216200/x**8 + 34459425/x**10)*jnp.sin(x) + (-1/x + 990/x**3 - 135135/x**5 + 4729725/x**7 - 34459425/x**9)*jnp.cos(x)
+_registered_bessel[10] = lambda x: (-55/x**2 + 25740/x**4 - 2837835/x**6 + 91891800/x**8 - 654729075/x**10)*jnp.cos(x) + (-1/x + 1485/x**3 - 315315/x**5 + 18918900/x**7 - 310134825/x**9 + 654729075/x**11)*jnp.sin(x)
+
+
+def _spherical_jn_series(ell, nterms=32):
+    r"""
+    Power series :math:`j_\ell(x) = \frac{x^\ell}{(2\ell+1)!!} \sum_k
+    \frac{(-x^2/2)^k}{k! (2\ell+3)(2\ell+5)\cdots(2\ell+2k+1)}`.
+
+    Entire, so it converges everywhere; ``nterms`` sets how far out in :math:`x` it stays at
+    machine precision. 24 terms carry it well past the crossover used by :func:`get_spherical_jn`.
+    """
+    dfact = 1.
+    for n in range(1, int(ell) + 1): dfact *= 2 * n + 1
+
+    def ser(x):
+        corr = term = jnp.ones_like(x)
+        for k in range(1, nterms + 1):
+            term = term * -x**2 / (2. * k * (2 * ell + 2 * k + 1))
+            corr = corr + term
+        return x**ell / dfact * corr
+
+    return ser
+
+
+def _spherical_jn_tophat_integral_series(ell, nterms=32):
+    r"""
+    Power series for :math:`\int_0^1 u^2 j_\ell(x u) du`, obtained by integrating that of
+    :func:`_spherical_jn_series` term by term:
+
+    .. math::
+
+        \frac{x^\ell}{(2\ell+1)!!} \sum_k \frac{(-x^2/2)^k}{k! (2\ell+3) \cdots (2\ell+2k+1)
+        \, (\ell + 2k + 3)}
+
+    i.e. the :math:`j_\ell` series with each term divided by :math:`\ell + 2k + 3`, the power of
+    :math:`u` it integrates to. Entire, like the series it comes from.
+    """
+    dfact = 1.
+    for n in range(1, int(ell) + 1): dfact *= 2 * n + 1
+
+    def ser(x):
+        term = jnp.ones_like(x)
+        corr = term / (ell + 3.)
+        for k in range(1, nterms + 1):
+            term = term * -x**2 / (2. * k * (2 * ell + 2 * k + 1))
+            corr = corr + term / (ell + 2 * k + 3.)
+        return x**ell / dfact * corr
+
+    return ser
 
 
 def get_spherical_jn(ell):
+    r"""
+    Return a function evaluating the spherical Bessel function of order ``ell`` (a static integer).
+
+    The tabulated closed forms carry coefficients of order :math:`(2\ell+1)!!` divided by powers of
+    :math:`x` --- :math:`6.5 \times 10^8 / x^{11}` already at :math:`\ell = 10` --- which cancel to
+    give an :math:`O(1)` result. Below :math:`x \sim \ell/2` that cancellation destroys the answer:
+    measured against :mod:`scipy`, the previous unconditional use of the closed form above
+    :math:`x = 0.1` was wrong by 1.9e-6 at :math:`\ell = 6`, 3.1e-2 at :math:`\ell = 8` and 1.0e+3
+    at :math:`\ell = 10`, over a region reaching up to :math:`x \approx 0.42 \ell - 1.4`.
+    The series is used there instead, and orders beyond the table fall back to the stable
+    recurrence of :func:`get_spherical_jn_all`.
+    """
+    ell = int(ell)
+    if ell not in _registered_bessel:
+        jn_all = get_spherical_jn_all(ell)
+        return lambda x: jn_all(x)[ell]
+
+    closed = _registered_bessel[ell]
+    # The cancellation region measured against scipy reaches ~0.42 * ell - 1.4, but the closed
+    # form only reaches full accuracy somewhat beyond it (the surviving cancellation still costs
+    # ~1e-13 at ell = 10 in float64, and ~1e-4 in float32, if the crossover is placed too early).
+    xswitch = max(1.5, 0.7 * ell)
+    ser = _spherical_jn_series(ell)
 
     def jn(x):
-        mask = x > 0.1
-        bessel = _registered_bessel[ell]
-        return jnp.where(mask, bessel[0](x), bessel[1](x))
+        x = jnp.asarray(x)
+        # hold the closed form away from small x, where its 1/x**(ell+1) terms overflow: the value
+        # is discarded there anyway, but inf - inf would poison the result with NaN
+        return jnp.where(x > xswitch, closed(jnp.where(x > xswitch, x, 1.)), ser(x))
 
     return jn
 
 
+@lru_cache(maxsize=None)
+def _legendre_recurrence_coeffs(ellmax: int):
+    r"""
+    Coefficients for the normalized associated Legendre recurrence
+    :math:`\lambda_{\ell m} = a_{\ell m} (x \lambda_{\ell-1, m} - b_{\ell m} \lambda_{\ell-2, m})`,
+    with :math:`Y_{\ell m} = \lambda_{\ell m}(\cos\theta) e^{i m \phi}` (Condon-Shortley phase included).
+    """
+    ls = np.arange(ellmax + 1)[:, None]
+    ms = np.arange(ellmax + 1)[None, :]
+    mask = ms < ls
+    with np.errstate(divide='ignore', invalid='ignore'):
+        a = np.where(mask, np.sqrt((4. * ls**2 - 1.) / np.where(mask, ls**2 - ms**2, 1.)), 0.)
+        b = np.where(mask, np.sqrt(np.abs(((ls - 1.)**2 - ms**2)) / (4. * (ls - 1.)**2 - 1.)), 0.)
+    ab = a * b
+    # diagonal: lambda_{ll} = -sqrt((2l+1)/(2l)) sin(theta) lambda_{l-1,l-1}
+    d = np.zeros(ellmax + 1)
+    d[1:] = -np.sqrt((2. * ls[1:, 0] + 1.) / (2. * ls[1:, 0]))
+    onehot = np.eye(ellmax + 1)
+    return a, ab, d, onehot
+
+
+def get_Ylm_all(ellmax: int, reduced: bool=False):
+    r"""
+    Return a function evaluating all spherical harmonics up to ``ellmax`` at once, at azimuth 0
+    where they are real, stacked on a leading axis in the flat order :math:`\ell^2 + \ell + m`
+    (so ``ell**2 + ell + m`` indexes the :math:`(\ell, m)` harmonic).
+
+    The all-orders counterpart of :func:`get_Ylm`, whose ``reduced`` convention it shares:
+    ``reduced=True`` gives :math:`y_{\ell m} = \sqrt{(\ell - m)! / (\ell + m)!} P_\ell^m(\cos\theta)`,
+    ``False`` the fully normalized :math:`Y_{\ell m}(\theta, 0)`, i.e. that times
+    :math:`\sqrt{(2\ell + 1) / 4\pi}`. Condon-Shortley phase included in both.
+
+    Built from the stable recurrence
+    :math:`\lambda_{\ell m} = a_{\ell m}(x \lambda_{\ell - 1, m} - b_{\ell m}\lambda_{\ell - 2, m})`
+    rather than from :func:`get_Ylm`'s tabulated closed forms. Two reasons, both growing with
+    ``ellmax``: those closed forms carry :math:`(2\ell+1)!!`-sized coefficients that cancel (2e-11
+    at :math:`\ell = 16` in float64, 7e-3 in float32, against :mod:`scipy`), and one lambdified
+    expression per :math:`(\ell, m)` unrolls into the enclosing jit -- 43033 jaxpr equations at
+    ``ellmax = 16`` against 1223 here, i.e. a 35x larger graph to compile.
+
+    :func:`get_Ylm`'s other two flags have no counterpart here, because the azimuth is fixed at 0:
+    the complex harmonic is real there (measured imaginary part exactly 0), so ``conj`` would be
+    the identity, and the ``real`` convention degenerates -- it gives :math:`\pm\sqrt{2}` times
+    the complex harmonic for :math:`m > 0` but vanishes identically for every :math:`m < 0`, half the
+    table. Callers summing over signed :math:`m` (the TripoSH shape factor) need the complex one.
+
+    Parameters
+    ----------
+    ellmax : int
+        Largest degree returned; the stack holds ``(ellmax + 1)**2`` harmonics.
+    reduced : bool, default=False
+        Drop the :math:`\sqrt{(2\ell + 1) / 4\pi}` normalization, as :func:`get_Ylm`'s own
+        ``reduced`` does (and with the same default).
+
+    Returns
+    -------
+    Ylm_all : callable
+        Function of :math:`\cos\theta`, returning an array of shape
+        ``((ellmax + 1)**2,) + cos.shape``.
+    """
+    ellmax = int(ellmax)
+    coeffs = _legendre_recurrence_coeffs(ellmax)
+    ells = np.array([ell for ell in range(ellmax + 1) for m in range(-ell, ell + 1)])
+    ms = np.array([m for ell in range(ellmax + 1) for m in range(-ell, ell + 1)])
+    # lambda_{ell m} is exactly Y_{ell m} at azimuth 0, and is defined for m >= 0 only: mirror m < 0 with
+    # y_{ell -m} = (-1)^m y_{ell m}, and strip sqrt((2 ell + 1) / 4 pi) if the reduced one is wanted
+    factor = np.where(ms < 0, (-1.)**ms, 1.)
+    if reduced: factor = factor * np.sqrt(4. * np.pi / (2. * ells + 1.))
+
+    def Ylm_all(cos):
+        cos = jnp.asarray(cos)
+        dtype = cos.dtype
+        a, ab, d, onehot = (jnp.asarray(tmp, dtype=dtype) for tmp in coeffs)
+        sin = jnp.sqrt(jnp.clip(1. - cos**2, 0., None))  # |cos| can exceed 1 by round-off; NaN * 0 would spread to every m
+        c00 = 1. / np.sqrt(4. * np.pi)
+        # lam holds lambda_{ell m} for all m at fixed ell, m on the last axis
+        lam = jnp.zeros(cos.shape + (ellmax + 1,), dtype=dtype).at[..., 0].set(c00)
+        diag = jnp.full(cos.shape, c00, dtype=dtype)
+
+        def step(carry, xs):
+            lam1, lam2, diag = carry
+            a_row, ab_row, d_ell, oh = xs
+            diag = d_ell * sin * diag                       # lambda_{ell ell}, the recurrence's seed
+            lam = a_row * (cos[..., None] * lam1) - ab_row * lam2 + diag[..., None] * oh
+            return (lam, lam1, diag), lam
+
+        table = lam[None]
+        if ellmax:
+            table = jnp.concatenate([table, jax.lax.scan(step, (lam, jnp.zeros_like(lam), diag),
+                                                         (a[1:], ab[1:], d[1:], onehot[1:]))[1]])
+        # (ell, ..., m) -> (row, ...), one row per (ell, m)
+        table = jnp.moveaxis(table, -1, 1)[ells, np.abs(ms)]
+        return jnp.asarray(factor, dtype=dtype).reshape((-1,) + (1,) * cos.ndim) * table
+
+    return Ylm_all
+
+
+def get_spherical_jn_all(ellmax: int, n_iter: int=None, xmin: float=0.1):
+    r"""
+    Return a function evaluating :math:`j_0` to :math:`j_{\ell_{\mathrm{max}}}` at once, stacked
+    along a leading axis.
+
+    :func:`get_spherical_jn` stops at :math:`\ell = 10` and evaluates the explicit closed form,
+    whose coefficients grow like :math:`(2\ell + 1)!!` --- already :math:`10^{17}` at
+    :math:`\ell = 16`, where they cancel catastrophically at moderate argument. This uses the
+    standard stable combination instead, and returns every order in one pass, which is what a
+    traced-order gather needs (indexing a Python table requires a static order).
+
+    Regimes, each valid where the others are not:
+
+    - :math:`x < x_{\mathrm{min}}`: power series
+      :math:`j_n(x) = \frac{x^n}{(2n+1)!!} \left(1 - \frac{x^2}{2(2n+3)} + \ldots\right)`;
+    - :math:`x > \ell`: upward recurrence
+      :math:`j_{n+1} = \frac{2n+1}{x} j_n - j_{n-1}`, stable only in this regime;
+    - otherwise: Miller's downward recurrence from ``n_iter``, seeded arbitrarily and rescaled at
+      the end onto the known :math:`j_0` (or :math:`j_1`, whichever is larger there --- their zeros
+      interlace, so they never vanish together and the normalization never degenerates).
+
+    Parameters
+    ----------
+    ellmax : int
+        Largest order returned.
+    n_iter : int, optional
+        Starting order of the downward recurrence. Defaults to ``ellmax + 40``. Only the
+        :math:`x \leq \ell` regime uses it, so it need not exceed the argument.
+    xmin : float, default=0.1
+        Below this the series is used, which also keeps the recurrences away from :math:`x = 0`.
+
+    Returns
+    -------
+    jn_all : callable
+        Function of ``x``, returning an array of shape ``(ellmax + 1,) + x.shape``.
+    """
+    ellmax = int(ellmax)
+    if n_iter is None: n_iter = ellmax + 40
+    if n_iter <= ellmax:
+        raise ValueError(f'n_iter = {n_iter} must exceed ellmax = {ellmax}')
+
+    def jn_all(x):
+        x = jnp.asarray(x)
+        # the recurrences divide by x; the series branch covers whatever is masked out here
+        safe = jnp.where(x < xmin, 1., x)
+        j0 = jnp.sin(safe) / safe
+        j1 = jnp.sin(safe) / safe**2 - jnp.cos(safe) / safe
+
+        # upward: stable for x > ell, garbage (but finite) below, and masked out there
+        ups = [j0] + ([j1] if ellmax >= 1 else [])
+        for n in range(1, ellmax):
+            ups.append((2 * n + 1) / safe * ups[n] - ups[n - 1])
+        up = jnp.stack(ups)
+
+        # Miller downward: the seed is arbitrary (the normalization below fixes the scale), but the
+        # recurrence grows by ~(2n+1)/x per step -- some 1e130 over the whole sweep at x = xmin --
+        # so it must be renormalized as it goes. A fixed small seed instead of renormalizing works
+        # in float64 but silently flushes to zero (hence 0/0 = NaN) in float32.
+        cap = jnp.asarray(np.sqrt(np.finfo(jnp.result_type(safe)).max), dtype=safe.dtype)
+        jp1, jcur = jnp.zeros_like(safe), jnp.ones_like(safe)
+        store = [None] * (ellmax + 1)
+        for n in range(n_iter, 0, -1):
+            jp1, jcur = jcur, (2 * n + 1) / safe * jcur - jp1
+            scale = jnp.where(jnp.abs(jcur) > cap, 1. / cap, jnp.ones_like(cap))
+            jcur, jp1 = jcur * scale, jp1 * scale
+            for k in range(ellmax + 1):  # orders already stored share the rescaling
+                if store[k] is not None: store[k] = store[k] * scale
+            if n - 1 <= ellmax: store[n - 1] = jcur
+        down = jnp.stack(store)
+        # normalize on whichever of j0, j1 is larger: sin(x)/x vanishes at multiples of pi
+        use0 = jnp.abs(j0) >= jnp.abs(j1)
+        down = down * jnp.where(use0, j0 / store[0], j1 / store[1])
+
+        # small-x series
+        xs = jnp.where(x < xmin, x, 0.)
+        ser, dfact = [], 1.
+        for n in range(ellmax + 1):
+            if n: dfact *= 2 * n + 1
+            # sum_k (-x^2 / 2)^k / (k! (2n+3)(2n+5)...(2n+2k+1)); 4 terms leave a relative
+            # truncation ~ x^10 / (2^5 5! 11!!) at worst, i.e. ~1e-16 at x = xmin = 0.1
+            corr = term = 1.
+            for k in range(1, 5):
+                term = term * -xs**2 / (2. * k * (2 * n + 2 * k + 1))
+                corr = corr + term
+            ser.append(xs**n / dfact * corr)
+        ser = jnp.stack(ser)
+
+        ell = jnp.arange(ellmax + 1).reshape((-1,) + (1,) * x.ndim)
+        return jnp.where(x < xmin, ser, jnp.where(x > jnp.maximum(ell, 1.), up, down))
+
+    return jn_all
+
+
 def get_spherical_jn_tophat_integral(ell):
+    r"""
+    Return a function of ``(xeval, edges)`` giving :math:`4\pi \int_{r_-}^{r_+} r^2 j_\ell(k r) dr`,
+    with :math:`k` the evaluation points and :math:`(r_-, r_+)` the last axis of ``edges``.
+
+    As in :func:`get_spherical_jn`, the tabulated closed form loses the argument to cancellation at
+    small :math:`x = k r`: against a 40-digit reference it is wrong by 5e-3 at :math:`\ell = 4` and
+    by a factor 10 at :math:`\ell = 5` at :math:`x = 0.1`, which the previous cut at 0.1 handed
+    straight through. :func:`_spherical_jn_tophat_integral_series` is used below the crossover.
+    """
+    closed = _registered_bessel_tophat_integral[ell]
+    xswitch = max(1.5, 0.7 * ell)
+    ser = _spherical_jn_tophat_integral_series(ell)
 
     def jn_tophat(xeval, edges):
         x = xeval[..., None, None] * edges
-        mask = x > 0.1
-        tophat = _registered_bessel_tophat_integral[ell]
-        w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3
+        mask = x > xswitch
+        # hold the closed form away from small x, where its inverse powers of x overflow: the value
+        # is discarded there anyway, but inf - inf would poison the result with NaN
+        w = jnp.where(mask, closed(jnp.where(mask, x, 1.)), ser(x)) * edges**3
         return 4. * np.pi * (w[..., 1] - w[..., 0])
 
     return jn_tophat
@@ -631,16 +985,80 @@ _legendre_product3 = {(0, 0, 0): 1, (0, 1, 1): 1/3, (0, 2, 2): 1/5, (0, 3, 3): 1
                       (6, 8, 8): 600/96577, (7, 7, 8): 1750/289731, (8, 8, 8): 490/96577}
 
 
-def wigner_3j(*ells):
+@lru_cache(maxsize=None)
+def _wigner_3j(*ells):
     from sympy.physics.wigner import wigner_3j
-    ells = map(int, ells)
     return float(wigner_3j(*ells))
 
 
+def wigner_3j(*ells):
+    return _wigner_3j(*map(int, ells))
+
+
+def _delta_log_6j(a, b, c):
+    """log of the Racah triangle coefficient Delta(abc); -inf if the triangle fails."""
+    from scipy.special import gammaln
+    if a + b - c < 0 or a - b + c < 0 or -a + b + c < 0:
+        return -np.inf
+    lf = lambda n: gammaln(n + 1.)
+    return 0.5 * (lf(a + b - c) + lf(a - b + c) + lf(-a + b + c) - lf(a + b + c + 1))
+
+
+@lru_cache(maxsize=None)
+def _wigner_6j(a, b, c, d, e, f):
+    """Racah formula for the 6j in floating point, via log-factorials."""
+    from scipy.special import gammaln
+    lf = lambda n: gammaln(n + 1.)
+    dl = (_delta_log_6j(a, b, c) + _delta_log_6j(a, e, f)
+          + _delta_log_6j(d, b, f) + _delta_log_6j(d, e, c))
+    if not np.isfinite(dl):
+        return 0.
+    a1, a2, a3, a4 = a + b + c, a + e + f, d + b + f, d + e + c
+    b1, b2, b3 = a + b + d + e, b + c + e + f, a + c + d + f
+    lo, hi = int(max(a1, a2, a3, a4)), int(min(b1, b2, b3))
+    if lo > hi:
+        return 0.
+    tot = 0.
+    for t in range(lo, hi + 1):
+        tot += (-1)**t * np.exp(dl + lf(t + 1) - lf(t - a1) - lf(t - a2) - lf(t - a3) - lf(t - a4)
+                                - lf(b1 - t) - lf(b2 - t) - lf(b3 - t))
+    return float(tot)
+
+
+@lru_cache(maxsize=None)
+def _wigner_9j(*ells):
+    """9j via the Racah single sum over 6j.
+
+    sympy's exact-rational wigner_9j costs 20-200 ms for each distinct symbol at the orders the
+    scoccimarro window matrix needs (and these calls are already lru_cached, so memoisation cannot
+    help further) -- which is what made ellmax >= 16 impractical. The identity
+
+        {a b c; d e f; g h i} = sum_x (-1)^(2x) (2x+1) {a b c; f i x}{d e f; b x h}{g h i; x a d}
+
+    with the 6j evaluated in floating point gives 20-58x, growing with ell, and agrees with sympy to
+    ~1e-16. The float 6j is essential here: using sympy's exact 6j inside this sum is slower than one
+    exact 9j (~0.6x), since it trades one exact symbol for ~30 of them.
+    """
+    a, b, c, d, e, f, g, h, i = ells
+    for (x, y, z) in ((a, b, c), (d, e, f), (g, h, i), (a, d, g), (b, e, h), (c, f, i)):
+        if not (abs(x - y) <= z <= x + y):
+            return 0.
+    lo = max(abs(a - i), abs(d - h), abs(b - f))
+    hi = min(a + i, d + h, b + f)
+    tot = 0.
+    for x in range(int(lo), int(hi) + 1):
+        t = _wigner_6j(a, b, c, f, i, x)
+        if t == 0.: continue
+        u = _wigner_6j(d, e, f, b, x, h)
+        if u == 0.: continue
+        v = _wigner_6j(g, h, i, x, a, d)
+        if v == 0.: continue
+        tot += (-1)**(2 * x) * (2 * x + 1) * t * u * v
+    return float(tot)
+
+
 def wigner_9j(*ells):
-    from sympy.physics.wigner import wigner_9j
-    ells = map(int, ells)
-    return float(wigner_9j(*ells))
+    return _wigner_9j(*map(int, ells))
 
 
 def legendre_product(*ells):
@@ -676,12 +1094,15 @@ def get_S(ells, z3=False):
         return lambda *args: 0.
 
     def _Ylm(ell, m, xhat):
-        # get_Ylm's non-real convention carries an extra (-1)**m for m < 0 only
-        # (none for m >= 0) relative to the plain amp * lpmv(|m|, ell, mu) *
-        # exp(i m phi) used to derive the Gaunt coefficients below; compensate
-        # so Sell is unchanged.
-        sign = (-1) ** m if m < 0 else 1
-        out = sign * get_Ylm(ell, m, reduced=True)(xhat[..., 0], xhat[..., 1], xhat[..., 2])
+        # No sign compensation is applied. This used to multiply by (-1)**m for m < 0, on the grounds that
+        # get_Ylm's non-real convention carries an extra such factor relative to the plain
+        # amp * lpmv(|m|, ell, mu) * exp(i m phi) the Gaunt coefficients were derived in. Measured,
+        # it does not: get_Ylm(ell, m, reduced=True) equals sqrt(4 pi / (2 ell + 1)) Y_ell^m to 1e-16
+        # for every m tested. The compensation was therefore spurious and broke the addition
+        # theorem -- the convention-free identity S_(l l 0)(x1, x2, x3) = L_l(x1.x2) failed by
+        # O(1) with it (l = 1 gave +0.269 against the correct -0.644) and holds to 1e-15 without.
+        # Guarded by test_utils.py::test_S.
+        out = get_Ylm(ell, m, reduced=True)(xhat[..., 0], xhat[..., 1], xhat[..., 2])
         # For e.g. ell = m = 0, get_Ylm's (lambdified) expression does not
         # depend on xhat at all, so it returns a bare scalar that doesn't
         # carry xhat's shape; broadcast explicitly.

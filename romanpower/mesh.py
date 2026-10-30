@@ -756,6 +756,9 @@ def _exchange_inverse_jax(array, indices):
 
 @default_sharding_mesh
 def _get_device_origin(shape, sharding_mesh=None):
+    # Plain tuple of Python ints, never a staticarray (callers pass attrs.meshsize).
+    # jax's Sharding.shard_shape is LRU-cached
+    shape = tuple(int(s) for s in shape)
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
     mapping = sharding.devices_indices_map(shape)
     ordered_devices = sharding_mesh.devices.ravel().tolist()
@@ -2200,7 +2203,7 @@ def _get_extent(*positions, mpicomm=None):
     """Return minimum physical extent (min, max) corresponding to input positions."""
     if not positions:
         raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
-    backend, _ = _get_distributed_backend(positions[0], mpicomm=mpicomm)
+    backend, kw = _get_distributed_backend(positions[0], mpicomm=mpicomm)
     # Find bounding coordinates
     nonempty_positions = [pos for pos in positions if pos.size]
     if backend == 'jax':
@@ -2214,6 +2217,9 @@ def _get_extent(*positions, mpicomm=None):
         if nonempty_positions:
             pos_min = np.array([np.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
             pos_max = np.array([np.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
+        # the communicator resolved by default_mpicomm inside _get_distributed_backend, which
+        # defaults to MPI.COMM_WORLD; the local `mpicomm` is still whatever the caller passed
+        mpicomm = kw['mpicomm']
         pos_min, pos_max = mpicomm.allgather(pos_min), mpicomm.allgather(pos_max)
         pos_min, pos_max = [p for p in pos_min if p is not None], [p for p in pos_max if p is not None]
         if not pos_min or not pos_max:
@@ -2536,7 +2542,8 @@ class ParticleField(object):
 
     @property
     def size(self):
-        return self.positions.shape[0]
+        # the number of particles, whatever leading axes the positions carry
+        return int(np.prod(self.positions.shape[:-1]))
 
     def sum(self, *args, **kwargs):
         """Sum of :attr:`weights`."""
@@ -2812,14 +2819,28 @@ def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('sharding_mesh',))
-def _get_hermitian_weights(coords, sharding_mesh=None):
+@partial(jax.jit, static_argnames=('meshsize', 'sharding_mesh'))
+def _get_hermitian_weights(coords, meshsize, sharding_mesh=None):
+    r"""
+    Weight of each mode of the Hermitian (rfft) layout in a sum over the full Fourier grid.
+
+    The rfft stores the last axis for :math:`0 \leq k_z \leq N/2` only. A plane
+    :math:`0 < k_z < N/2` stands for itself and its conjugate, so has weight 2. The plane
+    :math:`k_z = 0`, and for even :math:`N` the Nyquist plane :math:`k_z = N/2`, are their own
+    conjugates up to a permutation of :math:`(k_x, k_y)`, so every one of their modes is already
+    stored once and has weight 1. ``meshsize`` is needed because, from the coordinates alone, the last
+    stored plane of an even grid (Nyquist) cannot be told from the last positive plane of an odd one.
+    """
     shape = np.broadcast_shapes(*[xx.shape for xx in coords])
+    nyquist_plane = int(np.asarray(meshsize)[-1]) % 2 == 0
 
     def get_nonsingular(zvec):
         nonsingular = jnp.ones(shape, dtype='i4')
-        # Get the indices that have positive freq along symmetry axis = -1
-        nonsingular += zvec > 0.
+        # Positive frequencies along the symmetry axis (-1) count twice, except the self-conjugate Nyquist plane
+        doubled = zvec > 0.
+        if nyquist_plane:
+            doubled &= zvec < jnp.max(zvec)
+        nonsingular += doubled
         return nonsingular.ravel()
 
     if sharding_mesh.axis_names:
@@ -2828,6 +2849,36 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
                                     in_specs=P(*[axis if coords[-1].shape[iaxis] else None for iaxis, axis in enumerate(sharding_mesh.axis_names)]),
                                     out_specs=P(sharding_mesh.axis_names))
     return get_nonsingular(coords[-1])
+
+
+def _slab_bincount(ibin, weights, length, nslabs=1):
+    """
+    ``jnp.bincount`` accumulated slab by slab, the slab sums combined in the widest float available.
+    A single float32 bincount over ~1e6 entries per bin is off by up to ~1e-3 (enough to shift
+    k-bin centres by a tenth of a bin); slab sums bring this to ~1e-7. Output dtype is that of float ``weights``.
+    Counts (``weights`` None or integer) are exact int64 with x64; without it, int32 would overflow beyond
+    2**31 entries per bin, so the int32 slab counts are summed (and returned) in float32.
+    On GPU, entries are dealt round-robin over :func:`_get_nsub` sub-accumulators per bin instead of
+    contiguous slabs: same accuracy, but concurrent threads no longer add into the same accumulator
+    (in float32, a 256^3 mesh into 200 bins on an A100: 35 ms by slabs, 0.9 ms spread).
+    """
+    nsub = _get_nsub(length)
+    if weights is None or not jnp.issubdtype(weights.dtype, jnp.floating):
+        if jax.config.jax_enable_x64:
+            return _spread_bincount(ibin, None if weights is None else weights.astype('i8'), length, nsub)
+        sum_dtype = output_dtype = jnp.float32
+    else:
+        sum_dtype, output_dtype = jnp.promote_types(weights.dtype, jax.dtypes.canonicalize_dtype(np.float64)), weights.dtype
+    if nsub > 1:
+        return _spread_bincount(ibin, weights, length, nsub, dtype=sum_dtype).astype(output_dtype)
+    if nslabs <= 1:
+        return jnp.bincount(ibin, weights=weights, length=length).astype(output_dtype)
+    count = partial(jnp.bincount, length=length)
+    if weights is None:
+        toret = jax.vmap(count)(ibin.reshape(nslabs, -1))
+    else:
+        toret = jax.vmap(count)(ibin.reshape(nslabs, -1), weights.reshape(nslabs, -1))
+    return toret.sum(axis=0, dtype=sum_dtype).astype(output_dtype)
 
 
 @default_sharding_mesh
@@ -2840,13 +2891,9 @@ def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sha
         coords = coords.ravel()
 
         ibin = jnp.digitize(coords, edges, right=False)
-        length = len(edges) + 1
-        nsub = _get_nsub(length)
-        sbin = ibin * nsub + _sub_index(ibin.size, nsub, ibin.dtype) if nsub > 1 else ibin
-        x = _spread_bincount(sbin, coords if weights is None else coords * weights, length, nsub)[1:-1]
+        x = _slab_bincount(ibin, coords if weights is None else coords * weights, length=len(edges) + 1, nslabs=shape[0])[1:-1]
         del coords
-        nmodes = _spread_bincount(sbin, weights, length, nsub)[1:-1]
-        del sbin
+        nmodes = _slab_bincount(ibin, weights, length=len(edges) + 1, nslabs=shape[0])[1:-1]
         if not ravel:
             ibin = ibin.reshape(shape)
         return ibin, nmodes, x
@@ -2902,11 +2949,12 @@ def _sub_index(size, nsub, dtype):
     return jnp.tile(jnp.arange(nsub, dtype=dtype), size // nsub + 1)[:size]
 
 
-def _spread_bincount(ib, weights, length, nsub):
-    """:func:`jnp.bincount`, with the additions spread over ``nsub`` accumulators per bin."""
+def _spread_bincount(ib, weights, length, nsub, dtype=None):
+    """:func:`jnp.bincount`, with the additions spread over ``nsub`` accumulators per bin, summed in ``dtype``."""
     if nsub <= 1:
         return jnp.bincount(ib, weights=weights, length=length)
-    return jnp.bincount(ib, weights=weights, length=length * nsub).reshape(length, nsub).sum(axis=-1)
+    ib = ib * nsub + _sub_index(ib.size, nsub, ib.dtype)
+    return jnp.bincount(ib, weights=weights, length=length * nsub).reshape(length, nsub).sum(axis=-1, dtype=dtype)
 
 
 @default_sharding_mesh
@@ -2917,18 +2965,18 @@ def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
         ibin = [ibin]
 
     def _count(value, *ibin):
+        nslabs = value.shape[0] if value.ndim > 1 else 1
         value = value.ravel()
         if weights is not None:
             value *= weights
-        nsub = _get_nsub(length + 2)
 
         def count(ib):
-            if nsub > 1:  # ib is consumed only through the spread index
-                ib = ib * nsub + _sub_index(ib.size, nsub, ib.dtype)
-            if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
-                return (_spread_bincount(ib, value.real, length + 2, nsub)
-                        + 1j * _spread_bincount(ib, value.imag, length + 2, nsub))
-            return _spread_bincount(ib, value, length + 2, nsub)
+            return _slab_bincount(ib, value, length=length + 2, nslabs=nslabs)
+
+        if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
+
+            def count(ib):
+                return _slab_bincount(ib, value.real, length=length + 2, nslabs=nslabs) + 1j * _slab_bincount(ib, value.imag, length=length + 2, nslabs=nslabs)
 
         value = sum(count(ib.ravel() if ib.ndim > 1 else ib) for ib in ibin)
         return value[1:-1] / len(ibin)
@@ -3166,6 +3214,21 @@ def compute_box_normalization(*inputs: RealMeshField | ParticleField) -> jax.Arr
         normalization *= mesh.sum() / size
     norm = normalization * size * mattrs.cellsize.prod()**(1 - len(inputs))
     return norm
+
+
+def get_wide_angle_selection_mesh(mesh: RealMeshField, wa_order: int=1) -> RealMeshField:
+    r"""
+    Weight a selection mesh by :math:`x^{-n}`, :math:`n` the wide-angle order, :math:`x` the distance to the observer.
+
+    Used as the line-of-sight leg of the window correlation to obtain the order-:math:`n` window multipoles:
+    the first mesh of :func:`compute_mesh2_correlation`, e.g.
+    ``compute_mesh2_correlation(get_wide_angle_selection_mesh(randoms), randoms, los='firstpoint')``,
+    or the third mesh of :func:`compute_mesh3_correlation`.
+    """
+    xnorm = jnp.sqrt(sum(xx**2 for xx in mesh.attrs.rcoords(sparse=True)))
+    # The observer may sit on a mesh node (e.g. at a box corner): 0 * inf would turn the whole window into NaN
+    mask = xnorm == 0.
+    return mesh * jnp.where(mask, 0., jnp.where(mask, 1., xnorm)**(-wa_order))
 
 
 def _make_input_tuple(*inputs):
