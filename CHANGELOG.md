@@ -63,6 +63,18 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
     `_slab_bincount` now returns the per-axis counts as int64 under x64 and float32 without it, which
     fixes the overflow at its source, so the guard no longer triggers. It is kept as a safeguard.
 
+  Re-validated against the DESI DR2 `holi-v4-altmtl` LRG NGC reference, in double precision
+  (`~/Projects/Roman/RomanPower/Validation/sync-191d5c8/`, README finding 8):
+  - $P_\ell$ and $B$ on 1 and 4 GPUs still agree to ~4e-15. They match the pre-sync products
+    to 5e-16, and the pre-sync 4-GPU run to 3e-16.
+  - The covariance agrees with the pre-sync one to 1.5e-7.
+  - The window multipoles are unchanged to their cancellation floor.
+  - The window matrices change by upstream design and no longer match the reference element by
+    element. The $P$ window's theory basis is now linear splines, not cubic: unchanged to 6e-6 on
+    a smooth theory, except the $k = 0$ bin, where the cubic basis left spurious entries. The $B$
+    window now uses converged sub-node quadrature (`10b69fa`): smooth theories move by 0.3%.
+  - Upstream removed `compute_smooth3_spectrum_window`'s `flags` argument, which had been ignored.
+
 ### Fixed
 
 - **`nmodes` overflowed `int32` in the bispectrum binning**, silently corrupting
@@ -119,6 +131,16 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Known issues
 
+- **Multi-process runs started without MPI give silently wrong results when `mpi4py`
+  imports** (upstream code, before and after the sync). `_get_distributed_backend` (`mesh.py`)
+  picks the MPI backend whenever `jax.distributed` is initialised, the input is a numpy array,
+  `mpi4py` imports and each process has one device. It does not check that `MPI.COMM_WORLD`
+  spans the JAX processes. Under plain processes with `jax.distributed.initialize` (for example
+  the validation's `mplaunch.sh`), each process sees a size-1 communicator, and the exchanges
+  and reductions never see the other processes. On 4 processes the covariance's `WS`/`SW` came
+  out 4x and `SS` 16x, and $P_\ell$ / $B$ were off by 8-14%, with no error. Checking
+  `mpicomm.size == jax.process_count()` before choosing `'mpi'` would close it. Until then,
+  launch under MPI (`srun`) or hide `mpi4py`.
 - **`pt.spectrum4_redshift_tracer` is not a correct tree-level trispectrum** (found while
   validating `thecov.py`, which does not use it; `romanpower/pt.py` is left unchanged here):
   (i) `_F3_unsym` / `_G3_unsym` are not the standard recursion of Bernardeau et al. (2002,
