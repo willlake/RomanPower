@@ -133,11 +133,27 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   symmetry). (iii) `_Z3` lacks the $b_2 F_2(k_2, k_3)$ and $2 b_{G_2} K_{G_2}(k_1, k_{23}) F_2(k_2,
   k_3)$ third-order bias terms. Diagnostics: `~/Projects/Roman/Thecov/thecov_jax/debug_t0.py`.
 
-  *Probably superseded by the upstream sync:* `spectrum4_redshift_tracer` and `_para_channel` no
-  longer exist. Upstream `8110473` fixed the $F_3$/$G_3$ recursion (i), replaced the parallelogram
-  special case with a regularised generic evaluation (ii), and `24e25c6` carries the second-order bias
-  sector in full above third order (iii). The tree n-point now comes from `make_spectra_redshift_tracer`.
-  This has not been re-checked against `thecov._PTKernels`.
+  *Fixed by the upstream sync, checked against `thecov._PTKernels`:* `spectrum4_redshift_tracer` and
+  `_para_channel` no longer exist; the tree n-point now comes from `make_spectrum_redshift_tracer`.
+  (i) Upstream `8110473` fixed the $F_3$/$G_3$ recursion: `pt.make_Zn` for $n = 2, 3$ matches
+  `_PTKernels.Z2`/`Z3` to 1e-16 at random wavevectors, in real and redshift space, including the
+  $P_{13}$ limit $F_3(k, q, -q)$ and the degenerate $Z_3(k_1, -k_1, k_2)$. (iii) `24e25c6` carries the
+  second-order bias sector; with `BiasModel(b1, b2, bs)` mapped to `b2 = b2 + 2 bs/3`,
+  `bG2 = bs/2`, `bGamma3 = -bG2`, `b3 = bdG2 = bG3 = 0`, the kernels agree to the same precision.
+  (ii) The parallelogram is now evaluated generically; on exactly representable (dyadic)
+  wavevectors the tree $T(k_1, -k_1, k_2, -k_2)$ matches the explicit 12 + 4 term tree sum to 1.6e-12
+  in every leg order, so the factor of 2 is gone.
+
+- **`pt.make_spectrum_redshift_tracer(4)` is not reliable on the parallelogram with ordinary
+  floats** (new with the sync, upstream code). On random `float64` wavevectors $T(k_1, -k_1, k_2,
+  -k_2)$ differs from the explicit tree sum by more than 1e-8 in ~35% of configurations, by up to
+  ~480x pointwise, and its value depends on the order of the legs. The cause is round-off: some
+  momenta are built as sums of several legs (the closing leg, and most leaf-edge momenta, which
+  `make_body` sums over the three-leg side of the edge rather than taking the leaf), so the $k_1 - k_1$ pair inside a $Z_3$ vertex cancels only to
+  ~1e-17 $k$, and the $1/|k_{12}|$ vertex then amplifies a $G_2$ that vanishes only to round-off.
+  Only internal tree lines are snapped to zero (`_ZERO_EDGE`). Integrated over the
+  `thecov.compute_trispectrum_covariance` quadrature against Legendre weights it is a 0.01-2% effect
+  that does not converge with `nq`. `thecov` uses its own kernels and is unaffected.
 
 - `tests/test_mesh3.py::test_fkp3_shotnoise` fails under `jax_enable_x64 = False`. The test
   compares against hard-coded reference values with `np.allclose` at its default
