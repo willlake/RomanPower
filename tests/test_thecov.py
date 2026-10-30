@@ -68,6 +68,38 @@ def test_sample_kmodes():
     assert np.allclose(nmodes[:4], tj.count_modes(kedges, L)[:4])
 
 
+def test_sample_kmodes_shell_uniform():
+    """The continuous-shell branch draws every lattice mode of the shell with the same probability, as the enumerated one."""
+    L, kedges = 1000., [0.10, 0.11]
+    kfun = 2 * np.pi / L
+    n = int(np.ceil(kedges[1] / kfun))
+    ix = np.arange(-n, n + 1)
+    grid = np.stack(np.meshgrid(ix, ix, ix, indexing='ij'), axis=-1).reshape(-1, 3)
+    kr = np.sqrt((grid**2).sum(axis=1)) * kfun
+    shell = grid[(kr >= kedges[0]) & (kr < kedges[1])]
+    index = {tuple(p): i for i, p in enumerate(shell)}
+    expected = 100
+    modes = tj.sample_kmodes(kedges, L, max_modes=expected * len(shell), k_shell_approx=0., seed=2)[0][0]
+    counts = np.bincount([index[tuple(p)] for p in modes[:, :3].astype(int)], minlength=len(shell))  # KeyError if outside
+    chi2 = np.sum((counts - expected)**2 / expected)
+    assert abs(chi2 - len(shell)) < 5 * np.sqrt(2 * len(shell)), (chi2, len(shell))  # uniform radius in the bare shell: 4.8 len(shell)
+
+
+def test_gaussian_covariance_symmetric():
+    """The rows of the kernels come from the sampled k1 modes of their own bin: the Gaussian covariance is symmetrised."""
+    from romanpower.mesh import MeshAttrs
+    n, L = 32, 2 * np.pi / 0.01
+    attrs = MeshAttrs(meshsize=n, boxsize=L, boxcenter=np.array([1.6, 0.4, 0.25]) * L, dtype=float, fft_backend='jax')
+    x = (np.indices((n,) * 3) - n / 2 + 0.5) / (n / 2)
+    W22 = np.exp(-(x[0]**2 / 0.5 + x[1]**2 / 0.3 + x[2]**2 / 0.2))
+    window = tj.MeshWindow(W22, attrs, 12, W12=np.sqrt(W22))
+    kedges = tj.linear_kedges(0.02, 0.08, 0.02)
+    kernels = tj.compute_window_kernels(window, kedges, kmodes_sampled=32, batch_size=8, progress=False, seed=1, exact_high_order=False)
+    _, poles, _, _ = get_pk()
+    cov = tj.blocks_to_matrix(tj.gaussian_covariance_survey(kernels, poles(kedges[:-1] + 0.01), alpha=0.1, I22=window.I('22')))
+    assert np.array_equal(cov, cov.T)
+
+
 def test_gaussian_box_vs_cov2():
     """Box Gaussian formula against romanpower.cov2.compute_spectrum2_covariance(MeshAttrs, flags=('smooth',))."""
     from romanpower import MeshAttrs, compute_spectrum2_covariance

@@ -139,9 +139,11 @@ def sample_kmodes(kedges, boxsize, max_modes=1000, k_shell_approx=0.1, seed=None
     Sample integer modes :math:`(i_x, i_y, i_z, |i|)` (in units of the fundamental wavenumber) in each k-shell.
 
     Below ``k_shell_approx`` all lattice modes of the shell are enumerated and (at most) ``max_modes`` of them are
-    drawn (with replacement, as ``thecov``); above, ``max_modes`` modes are drawn uniformly in the continuous shell
-    and rounded to the lattice. Returns the list of ``(n_i, 4)`` arrays and the number of modes per shell
-    (exact counts below ``k_shell_approx``, continuum above), following ``thecov.math.sample_kmodes``.
+    drawn (with replacement, as ``thecov``); above, ``max_modes`` lattice modes of the shell are drawn with the same
+    uniform probability without enumerating them: points uniform in the volume of the shell widened by half a cell
+    diagonal are rounded to the lattice and kept if inside the shell. Returns the list of ``(n_i, 4)`` arrays and the
+    number of modes per shell (exact counts below ``k_shell_approx``, continuum above), following
+    ``thecov.math.sample_kmodes``.
     """
     if rng is None:
         rng = np.random.default_rng(seed)
@@ -166,15 +168,19 @@ def sample_kmodes(kedges, boxsize, max_modes=1000, k_shell_approx=0.1, seed=None
             nmodes.append(N)
     for i in range(i_shell, nbins):
         rmin, rmax = kedges[i] / kfun, kedges[i + 1] / kfun
+        # Each lattice mode of the shell has its whole rounding cell inside the widened shell, hence the same probability.
+        # Uniform in radius in the bare shell (thecov) under-weights the outer half of the shell and both of its edges.
+        pad = np.sqrt(3.) / 2.
+        vmin, vmax = max(rmin - pad, 0.)**3, (rmax + pad)**3
         out = []
         while len(out) < max_modes:
             n = 2 * (max_modes - len(out)) + 16
-            r = rmin + (rmax - rmin) * rng.random(n)
+            r = np.cbrt(vmin + (vmax - vmin) * rng.random(n))
             theta = 2 * np.pi * rng.random(n)
             phi = np.arccos(1 - 2 * rng.random(n))
             xyz = np.round(np.array([r * np.sin(phi) * np.cos(theta), r * np.sin(phi) * np.sin(theta), r * np.cos(phi)]).T)
             rr = np.sqrt((xyz**2).sum(axis=1))
-            ok = (rr >= rmin) & (rr <= rmax)
+            ok = (rr >= rmin) & (rr < rmax)  # as the k2 binning, floor(|k| / dk)
             out.extend(np.column_stack([xyz[ok], rr[ok]]))
         modes.append(np.array(out[:max_modes]))
         nmodes.append(boxsize**3 / (6 * np.pi**2) * (kedges[i + 1]**3 - kedges[i]**3))
@@ -943,6 +949,10 @@ def gaussian_covariance_survey(kernels, pk, alpha=0., I22=1., pk_renorm=1., ells
     blocks : array (3, 3, nk, nk)
         Blocks ``[il1, il2]`` for ``ells``; ``blocks_to_matrix`` stacks them. If ``return_terms``, a dict with
         the cosmic-variance, mixed and shot-noise contributions separately.
+        The auto-multipole blocks are symmetrised, as in CovaPT's ``CovMatGauss``. :math:`C(k_i, k_j)` and
+        :math:`C(k_j, k_i)` come from the sampled :math:`k_1` modes of different bins. Also, CovaPT evaluates
+        :math:`P(q)` at :math:`k_2` in the window factor that carries both estimator Legendre polynomials and at
+        :math:`k_1` in the other, which is not symmetric under :math:`k_1 \leftrightarrow k_2` for :math:`\ell \geq 2`.
     """
     kernels = np.asarray(kernels)
     nk = kernels.shape[0]
@@ -962,9 +972,10 @@ def gaussian_covariance_survey(kernels, pk, alpha=0., I22=1., pk_renorm=1., ells
         blocks = np.zeros((3, 3, nk, nk))
         for m, (l1, l2) in enumerate(kernel_ells):
             i1, i2 = l1 // 2, l2 // 2
-            blocks[i1, i2] = cov6[..., m]
-            if i1 != i2:
-                blocks[i2, i1] = cov6[..., m].T
+            if i1 == i2:
+                blocks[i1, i1] = (cov6[..., m] + cov6[..., m].T) / 2.
+            else:
+                blocks[i1, i2], blocks[i2, i1] = cov6[..., m], cov6[..., m].T
         return blocks
 
     if return_terms:

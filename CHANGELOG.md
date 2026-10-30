@@ -77,6 +77,37 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The `thecov` $k$-mode sampler did not draw lattice modes uniformly above `k_shell_approx`**
+  (`romanpower/thecov.py`, `sample_kmodes`), biasing the Gaussian survey covariance.
+
+  Above `k_shell_approx` the modes are not enumerated: random points are drawn in the continuous
+  shell and rounded to the lattice. The radius was drawn uniformly in $[r_\mathrm{min}, r_\mathrm{max}]$
+  of the bare shell, as `thecov.math.sample_from_shell` does. That ignores the $r^2$ Jacobian, so the
+  outer half of the shell is under-weighted. It also under-samples the modes within half a lattice
+  spacing of either edge, whose rounding cell sticks out of the shell, by ~22%. Against an exact
+  enumeration at $k = 0.10$ the draws were 35σ from uniform ($\chi^2 = 4.8\,N_\mathrm{modes}$).
+  The points are now drawn uniformly in volume over the shell widened by half a cell diagonal,
+  $\sqrt{3}/2$, rounded, and kept if $r_\mathrm{min} \le |n| < r_\mathrm{max}$. Every lattice mode of the
+  shell then has its whole rounding cell inside the widened shell, hence the same probability. The
+  half-open bound matches the $k$ binning (`floor(|k| / dk)`); it used to be closed at both ends.
+
+  On the Roman `clean_z1p0_1p2` analytic covariance (ShapeFit project, GPU check job 60559791) the
+  old sampler made the $\ell = 0$ Gaussian variance at $k \ge 0.1$ too high by $0.85 \pm 0.13\%$, and gave
+  $C_{i,i+1} < C_{i+1,i}$ in 17 of 20 adjacent pairs. With the fix the variance agrees with exact
+  lattice sampling ($+0.17 \pm 0.13\%$ and $+0.02 \pm 0.11\%$ for two seeds), and the one-sided
+  asymmetry is gone. A full-shape fit with the fixed covariance moves the posterior means by
+  ≤ 0.05σ. The bias grows as the shells get thinner. The DESI LRG validation in
+  `~/Projects/Roman/Thecov/thecov_jax/VALIDATION.md` used the old sampler with $\Delta k = 0.005$
+  and has not been re-checked. `tests/test_thecov.py::test_sample_kmodes_shell_uniform` fails on the
+  old code.
+
+  `gaussian_covariance_survey` also symmetrises its auto-multipole blocks now, as CovaPT's
+  `CovMatGauss` does. $C(k_i, k_j)$ and $C(k_j, k_i)$ come from the sampled $k_1$ modes of different
+  bins, so they differ by sampling noise. For $\ell \ge 2$ CovaPT's own approximation is not symmetric
+  either: it evaluates $P(q)$ at $k_2$ in the window factor that carries both estimator Legendre
+  polynomials, and at $k_1$ in the other. The returned matrix used to be slightly non-symmetric
+  (`test_gaussian_covariance_symmetric`).
+
 - **`nmodes` overflowed `int32` in the bispectrum binning**, silently corrupting
   `compute_mesh3_spectrum` beyond a mesh-dependent scale (`romanpower/mesh3.py`).
 
