@@ -84,8 +84,10 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   shell and rounded to the lattice. The radius was drawn uniformly in $[r_\mathrm{min}, r_\mathrm{max}]$
   of the bare shell, as `thecov.math.sample_from_shell` does. That ignores the $r^2$ Jacobian, so the
   outer half of the shell is under-weighted. It also under-samples the modes within half a lattice
-  spacing of either edge, whose rounding cell sticks out of the shell, by ~22%. Against an exact
-  enumeration at $k = 0.10$ the draws were 35σ from uniform ($\chi^2 = 4.8\,N_\mathrm{modes}$).
+  spacing of either edge, whose rounding cell sticks out of the shell: on a $15 \le |n| < 16.5$ shell
+  the inner- and outer-edge modes are drawn 7.3% and 11.8% too rarely. Against an exact enumeration
+  of the $0.10 \le k < 0.11$ shell of a $1000\,\mathrm{Mpc}/h$ box (5696 modes, 100 draws each) the counts
+  have $\chi^2 = 4.8\,N_\mathrm{modes}$, where uniform draws give $(1 \pm 0.02)\,N_\mathrm{modes}$.
   The points are now drawn uniformly in volume over the shell widened by half a cell diagonal,
   $\sqrt{3}/2$, rounded, and kept if $r_\mathrm{min} \le |n| < r_\mathrm{max}$. Every lattice mode of the
   shell then has its whole rounding cell inside the widened shell, hence the same probability. The
@@ -96,9 +98,9 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   $C_{i,i+1} < C_{i+1,i}$ in 17 of 20 adjacent pairs. With the fix the variance agrees with exact
   lattice sampling ($+0.17 \pm 0.13\%$ and $+0.02 \pm 0.11\%$ for two seeds), and the one-sided
   asymmetry is gone. A full-shape fit with the fixed covariance moves the posterior means by
-  ≤ 0.05σ. The bias grows as the shells get thinner. The DESI LRG validation in
-  `~/Projects/Roman/Thecov/thecov_jax/VALIDATION.md` used the old sampler with $\Delta k = 0.005$
-  and has not been re-checked. `tests/test_thecov.py::test_sample_kmodes_shell_uniform` fails on the
+  ≤ 0.05σ. The DESI LRG validation in `~/Projects/Roman/Thecov/thecov_jax/VALIDATION.md` used the
+  old sampler, with $\Delta k = 0.005$, and has not been re-checked. The same fix is in the
+  `willlake/thecov` fork (`6b7c6d2`). `tests/test_thecov.py::test_sample_kmodes_shell_uniform` fails on the
   old code.
 
   `gaussian_covariance_survey` also symmetrises its auto-multipole blocks now, as CovaPT's
