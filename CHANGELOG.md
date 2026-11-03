@@ -77,6 +77,44 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Several GPUs in one process deadlocked intermittently in `ParticleField.paint`** (the known
+  issue below until 2026-11-02; upstream jax-power has it too). `romanpower/__init__.py` now sets
+  `XLA_FLAGS=--xla_gpu_use_memcpy_local_p2p=true` on import (`_set_xla_p2p_flag`), unless
+  `XLA_FLAGS` already sets that flag; `=false` turns it off.
+
+  Cause, from gdb on the hung process (4 x A100-40GB, a 708^3 mesh split 2 x 2):
+  - XLA makes the cuFFT plans of an executable at its first run, on one host thread per GPU.
+    Here that is inside the interlacing `lax.scan` of the paint, and each new particle count is a
+    new executable.
+  - cuFFT holds a process-wide lock while it makes a plan, and each new plan loads a CUDA module
+    (`cuModuleLoadData`), which waits for its GPU to go idle.
+  - That GPU was running an NCCL collective (a jaxdecomp FFT transpose or a halo exchange),
+    waiting for its peers. Their host threads were waiting for the cuFFT lock, so they never
+    joined. Hence two GPUs at 100 % and two idle.
+
+  Upstream jax-power (adematti/main 3746ee2) hangs the same way, with the same stacks. Its paint,
+  exchange and FFT code is the same, and the bug is between XLA and cuFFT. With the flag, XLA
+  runs the single-process all-to-alls and collective-permutes as peer-to-peer copies behind a host
+  rendezvous, so no GPU enters a collective ahead of the others.
+
+  XLA reads `XLA_FLAGS` at its first computation, so `romanpower` must be imported before
+  anything runs in JAX. Otherwise the import warns, if the process sees several devices. The flag
+  does nothing on one GPU, on CPU, or with one GPU per process (`jax.distributed`), whose
+  collectives are not local.
+
+  Validation on 4 x A100-40GB, jax 0.10.2, jaxdecomp 0.3.1 (scripts in
+  `$PSCRATCH/RomanClustering/debug_paint/`):
+  - **64^3 paints, one process on 4 GPUs** (`small_paint_check.py`): with the flag off, 1 of 2
+    processes hung at its first paint. With it, 2 of 2 painted steadily until the timeout (13
+    paints each), with the same values.
+  - **Roman spectrum + window** (708^3 mesh, `romanpower` imported first, no `XLA_FLAGS` in the
+    environment): without the flag 2 of 3 windows hung (upstream: 1 of 1). With the flag set
+    on import, 6 of 6 windows passed. The products equal the flag-off ones to 1e-13, in the same
+    time.
+  - **One GPU per process** (`srun -n 4 --gpus 4`, `jax.distributed`; `multiproc_check.py`):
+    P_ell is the same with the flag on, off, and in the DESI-MG env, to 4e-16, and matches one
+    process on 4 GPUs to 5e-16.
+
 - **The `thecov` $k$-mode sampler did not draw lattice modes uniformly above `k_shell_approx`**
   (`romanpower/thecov.py`, `sample_kmodes`), biasing the Gaussian survey covariance.
 
@@ -256,10 +294,11 @@ follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
   With the catalogs sliced, the covariance reproduces the DESI reference: sigma to a median
   of 9.6e-05 and the correlation matrix to 7.9e-04, the residual being the random split
   drawing differently at a different process count.
-- `create_sharding_mesh()` with several local devices in a single process hangs in
-  `ParticleField.paint` (reproduced at a 64^3 mesh, where painting should take
+- ~~`create_sharding_mesh()` with several local devices in a single process hangs in
+  `ParticleField.paint`~~ (reproduced at a 64^3 mesh, where painting should take
   milliseconds). One process per GPU via `jax.distributed.initialize()` -- what the DESI
-  production scripts use -- works and paints the same case in ~1 s.
+  production scripts use -- works and paints the same case in ~1 s. Fixed on 2026-11-02:
+  see Fixed, "Several GPUs in one process deadlocked".
 - `BinMesh3CorrelationPoles(buffer_size=3)` — the DESI fiducial for LRG — asks for ~79 GB on
   a 750³ mesh in double precision, which does not fit even an 80 GB GPU in a single process.
   `buffer_size` trades memory for speed without changing the result; drop it to 0 there, or

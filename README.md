@@ -101,6 +101,10 @@ with create_sharding_mesh() as sharding_mesh:  # distribute mesh and particles
 jax.distributed.shutdown()
 ```
 
+The same code runs in a single process that sees several GPUs (no `jax.distributed`): the mesh is then split over the local GPUs.
+That mode needs `XLA_FLAGS=--xla_gpu_use_memcpy_local_p2p=true`, or the painting can deadlock. `import romanpower` sets it, so import
+romanpower before running anything in JAX, or set the flag yourself before starting Python.
+
 📝 Example notebooks are available in the `nb/` directory, and tests in `tests/`
 (each test file runs as a plain script via its `__main__` block).
 

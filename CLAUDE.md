@@ -95,6 +95,8 @@ For bispectra, replace `mesh2` → `mesh3` throughout.
 
 Wrap all computation in `with create_sharding_mesh() as sharding_mesh:`. The context manager sets up `jaxdecomp` for distributed 3-D FFTs. `create_sharded_array` and `create_sharded_random` create globally-shaped arrays sharded across devices using `shard_map`. `ParticleField(..., exchange=True)` redistributes particles so each device owns the particles that fall in its spatial shard.
 
+One process can also drive all the GPUs of a node (no `jax.distributed`). That needs `XLA_FLAGS=--xla_gpu_use_memcpy_local_p2p=true` before JAX's first computation, which `romanpower/__init__.py` sets on import (`_set_xla_p2p_flag`). Without it the painting deadlocks intermittently, between cuFFT's process-wide plan lock and NCCL collectives; upstream jax-power has the same deadlock (CHANGELOG, Fixed). So import `romanpower` before running anything in JAX. When syncing with upstream, keep that function at the top of `__init__.py`.
+
 ### JIT usage
 
 `compute_mesh2_spectrum` and similar top-level functions are JIT-friendly. The line-of-sight `los` argument must be declared static:
